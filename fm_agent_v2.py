@@ -214,21 +214,6 @@ def retrain_from_feedback(base_df: pd.DataFrame, equipment: str) -> dict | None:
 # 4. AI AGENT CORE — Named-feature logic
 # ─────────────────────────────────────────────
 
-def predict(model, features: dict) -> tuple[float, str]:
-    """Returns (probability, risk_label). Uses calibrated probabilities."""
-    X = pd.DataFrame([features])[FEATURE_NAMES]
-    prob = model.predict_proba(X)[0][1]
-
-    if prob > 0.70:
-        risk = "HIGH"
-    elif prob > 0.40:
-        risk = "MEDIUM"
-    else:
-        risk = "LOW"
-
-    return round(prob, 4), risk
-
-
 def diagnose(features: dict) -> list[str]:
     """Named-feature threshold checks — no magic indices."""
     issues = []
@@ -241,9 +226,41 @@ def diagnose(features: dict) -> list[str]:
     return issues
 
 
+def predict(model, features: dict) -> tuple[float, str]:
+    """
+    Returns (probability, risk_label).
+    Risk combines ML probability AND simultaneous issue count:
+      - 3+ violations escalates LOW → MEDIUM
+      - 4+ violations escalates anything → HIGH
+    Prevents the model under-calling risk when many sensors are in the red.
+    """
+    X = pd.DataFrame([features])[FEATURE_NAMES]
+    prob = model.predict_proba(X)[0][1]
+
+    # Base risk from model probability (lowered thresholds for FM sensitivity)
+    if prob > 0.60:
+        risk = "HIGH"
+    elif prob > 0.30:
+        risk = "MEDIUM"
+    else:
+        risk = "LOW"
+
+    # Escalate based on simultaneous threshold violations
+    n_issues = len(diagnose(features))
+    if n_issues >= 4:
+        risk = "HIGH"
+    elif n_issues >= 3 and risk == "LOW":
+        risk = "MEDIUM"
+
+    return round(prob, 4), risk
+
+
 def recommend(risk: str, issues: list[str]) -> str:
-    if risk == "HIGH":
+    n = len(issues)
+    if risk == "HIGH" or n >= 4:
         return "⛔ Immediate inspection required — escalate to senior technician"
+    if n >= 3:
+        return "⚠️ Multiple faults detected — urgent maintenance within 24 h"
     if any("aging" in i.lower() for i in issues):
         return "🛠️ Schedule preventive maintenance within 48 h"
     if any("torque" in i.lower() for i in issues):
