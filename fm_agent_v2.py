@@ -562,14 +562,19 @@ def main():
                     st.rerun()
                 else:
                     st.session_state.sim_running = False
-                    st.success(f"Simulation complete — {len(rows)} steps processed.")
+                    # Log highest-risk step to DB as a work order
+                    history = st.session_state.sim_history
+                    worst   = max(history, key=lambda h: h["prob"])
+                    sim_row_id = log_prediction(
+                        eq, worst["features"], worst["prob"], worst["risk"]
+                    )
+                    st.session_state.sim_worst_row_id = sim_row_id
+                    st.rerun()
             else:
                 st.session_state.sim_running = False
                 st.rerun()
 
         elif st.session_state.sim_history:
-            # Show final state after simulation ends
-            st.markdown("### Simulation complete")
             history = st.session_state.sim_history
             steps_x = [h["step"] for h in history]
             probs_y = [h["prob"]  for h in history]
@@ -579,61 +584,131 @@ def main():
                 elif h["risk"] == "MEDIUM": colors.append("#EF9F27")
                 else:                       colors.append("#1D9E75")
 
+            # ── Trend chart ──────────────────────────────────────
             fig, ax = plt.subplots(figsize=(9, 3))
             ax.plot(steps_x, probs_y, color="#888780", linewidth=1.2, zorder=1)
             ax.scatter(steps_x, probs_y, c=colors, s=40, zorder=2)
-            ax.axhline(0.70, color="#E24B4A", linestyle="--", linewidth=0.8, label="High (0.70)")
-            ax.axhline(0.40, color="#EF9F27", linestyle="--", linewidth=0.8, label="Medium (0.40)")
+            ax.axhline(0.55, color="#E24B4A", linestyle="--", linewidth=0.8, label="High (0.55)")
+            ax.axhline(0.28, color="#EF9F27", linestyle="--", linewidth=0.8, label="Medium (0.28)")
             ax.set_xlabel("Simulation step")
-            ax.set_ylabel("Failure probability")
+            ax.set_ylabel("Blended risk score")
             ax.set_ylim(0, 1)
-            ax.set_title("Final simulation result", fontsize=11)
+            ax.set_title("Simulation result — full run", fontsize=11)
             ax.legend(fontsize=8, loc="upper left")
             fig.tight_layout()
             st.pyplot(fig)
             plt.close(fig)
 
-            hist_df = pd.DataFrame([
-                {"Step": h["step"], "Probability": f"{h['prob']:.1%}",
-                 "Risk": h["risk"], "Action": h["action"]}
-                for h in history
-            ])
-            st.dataframe(hist_df, use_container_width=True, hide_index=True)
+            # ── Conclusion verdict ───────────────────────────────
+            n_total  = len(history)
+            n_high   = sum(1 for h in history if h["risk"] == "HIGH")
+            n_medium = sum(1 for h in history if h["risk"] == "MEDIUM")
+            avg_prob = sum(h["prob"] for h in history) / n_total
+            worst    = max(history, key=lambda h: h["prob"])
+
+            st.markdown("---")
+            st.markdown("### 📋 Simulation conclusion")
+
+            v_col1, v_col2, v_col3 = st.columns(3)
+            v_col1.metric("Avg blended score",  f"{avg_prob:.1%}")
+            v_col2.metric("High-risk steps",    f"{n_high} / {n_total}")
+            v_col3.metric("Peak risk score",    f"{worst['prob']:.1%}",
+                          f"Step {worst['step']} — {worst['risk']}")
+
+            # Overall maintenance verdict
+            if n_high >= 3 or avg_prob > 0.55:
+                st.error(
+                    "⛔ **Maintenance required — schedule immediately.**  \n"
+                    f"{n_high} of {n_total} steps flagged HIGH risk. "
+                    f"Peak score {worst['prob']:.1%} at step {worst['step']}. "
+                    "Escalate to senior technician and raise urgent work order."
+                )
+            elif n_high >= 1 or n_medium >= int(n_total * 0.3) or avg_prob > 0.28:
+                st.warning(
+                    "⚠️ **Preventive maintenance recommended within 48 h.**  \n"
+                    f"{n_high} HIGH + {n_medium} MEDIUM steps detected. "
+                    f"Average blended score {avg_prob:.1%}. "
+                    "Schedule inspection before next operational cycle."
+                )
+            else:
+                st.success(
+                    "✅ **Equipment operating normally — no immediate action required.**  \n"
+                    f"All {n_total} steps within acceptable range. "
+                    f"Average score {avg_prob:.1%}. Continue routine monitoring schedule."
+                )
+
+            # ── Step-by-step table ───────────────────────────────
+            with st.expander("View step-by-step breakdown"):
+                hist_df = pd.DataFrame([
+                    {"Step": h["step"],
+                     "Blended score": f"{h['prob']:.1%}",
+                     "Risk":   h["risk"],
+                     "Action": h["action"]}
+                    for h in history
+                ])
+                st.dataframe(hist_df, use_container_width=True, hide_index=True)
 
     # ── TAB 3: Work order queue ───────────────────────────────────
     with tab3:
         st.subheader("Work order queue (ranked by priority score)")
+        st.caption("Includes both manual predictions and simulation results.")
         fb_df = load_feedback()
 
         if fb_df.empty:
-            st.info("No predictions logged yet. Run a prediction in the Prediction tab first.")
+            st.info("No predictions logged yet. Run a prediction or simulation first.")
         else:
             import json
-            rows = []
+            wo_rows = []
             for _, row in fb_df.iterrows():
                 try:
                     feat = json.loads(row["features"])
                 except Exception:
                     continue
-                risk = row["risk"]
-                eq   = row["equipment"]
-                prob = row["probability"]
+                risk  = row["risk"]
+                eq    = row["equipment"]
+                prob  = row["probability"]
                 score = priority_score(prob, eq, risk)
-                rows.append({
-                    "WO ID":          f"WO-{row['id']:05d}",
-                    "Timestamp":      row["ts"][:16],
-                    "Equipment":      eq,
-                    "Risk":           risk,
-                    "Probability":    f"{prob:.1%}",
-                    "Priority ($)":   f"{score:,.0f}",
-                    "Confirmed":      {1: "✅ Yes", 0: "❌ No alarm"}.get(row["confirmed"], "⏳ Pending"),
+
+                # Derive purpose from risk + issues
+                issues_snap = diagnose(feat)
+                n_iss = len(issues_snap)
+                if risk == "HIGH" or n_iss >= 4:
+                    purpose = "⛔ Immediate inspection"
+                elif risk == "MEDIUM" or n_iss >= 3:
+                    purpose = "⚠️ Preventive maintenance"
+                elif any("aging" in i.lower() for i in issues_snap):
+                    purpose = "🛠️ Scheduled overhaul"
+                elif any("temperature" in i.lower() for i in issues_snap):
+                    purpose = "🌡️ Cooling system check"
+                elif any("torque" in i.lower() for i in issues_snap):
+                    purpose = "🔧 Motor load check"
+                else:
+                    purpose = "📋 Routine monitoring"
+
+                confirmed_val = row["confirmed"]
+                if confirmed_val == 1:   status = "✅ Confirmed"
+                elif confirmed_val == 0: status = "❌ False alarm"
+                else:                    status = "⏳ Pending"
+
+                wo_rows.append({
+                    "WO ID":       f"WO-{row['id']:05d}",
+                    "Timestamp":   row["ts"][:16].replace("T", " "),
+                    "Equipment":   eq,
+                    "Risk":        risk,
+                    "Score":       f"{prob:.1%}",
+                    "Priority ($)": score,
+                    "Purpose":     purpose,
+                    "Status":      status,
                 })
 
             wo_df = (
-                pd.DataFrame(rows)
-                .sort_values("Priority ($)", ascending=False, key=lambda x: x.str.replace(",", "").str.replace("$", "").astype(float))
+                pd.DataFrame(wo_rows)
+                .sort_values("Priority ($)", ascending=False)
+                .reset_index(drop=True)
             )
-            st.dataframe(wo_df, use_container_width=True)
+            # Format priority for display after sorting
+            wo_df["Priority ($)"] = wo_df["Priority ($)"].apply(lambda x: f"${x:,.0f}")
+            st.dataframe(wo_df, use_container_width=True, hide_index=True)
 
     # ── TAB 4: Feedback log ───────────────────────────────────────
     with tab4:
