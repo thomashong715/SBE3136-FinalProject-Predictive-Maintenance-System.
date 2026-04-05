@@ -699,6 +699,34 @@ def main():
                 else:
                     st.success("Augmented dataset ready. Plug into your CI/CD retraining pipeline.")
 
+            st.markdown("---")
+            st.markdown("**Danger zone**")
+            if "confirm_clear" not in st.session_state:
+                st.session_state.confirm_clear = False
+
+            if not st.session_state.confirm_clear:
+                if st.button("🗑️ Clear all feedback data"):
+                    st.session_state.confirm_clear = True
+                    st.rerun()
+            else:
+                st.warning("This will permanently delete all predictions and feedback. Are you sure?")
+                col_yes, col_no = st.columns(2)
+                with col_yes:
+                    if st.button("Yes, delete everything", type="primary"):
+                        con = sqlite3.connect(DB_PATH)
+                        con.execute("DELETE FROM feedback")
+                        con.commit()
+                        con.close()
+                        st.session_state.confirm_clear = False
+                        st.session_state.last_row_id = None
+                        st.session_state.last_feedback_given = False
+                        st.success("All data cleared.")
+                        st.rerun()
+                with col_no:
+                    if st.button("Cancel"):
+                        st.session_state.confirm_clear = False
+                        st.rerun()
+
     # ── TAB 5: Model info ─────────────────────────────────────────
     with tab5:
         st.subheader(f"Model performance — {equipment}")
