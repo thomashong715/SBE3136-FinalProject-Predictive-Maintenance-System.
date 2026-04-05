@@ -364,12 +364,37 @@ def main():
 
     # ── TAB 1: Manual prediction ─────────────────────────────────
     with tab1:
+        if "last_row_id" not in st.session_state:
+            st.session_state.last_row_id = None
+        if "last_feedback_given" not in st.session_state:
+            st.session_state.last_feedback_given = False
+
         if st.button("▶ Run prediction", type="primary"):
             ml_prob, blended, risk = predict(model, features)
             issues  = diagnose(features)
             action  = recommend(risk, issues)
             row_id  = log_prediction(equipment, features, blended, risk)
             wo      = build_work_order(equipment, features, blended, risk, issues, action, row_id)
+
+            # Persist prediction results across reruns
+            st.session_state.last_row_id          = row_id
+            st.session_state.last_feedback_given  = False
+            st.session_state.last_ml_prob         = ml_prob
+            st.session_state.last_blended         = blended
+            st.session_state.last_risk            = risk
+            st.session_state.last_issues          = issues
+            st.session_state.last_action          = action
+            st.session_state.last_wo              = wo
+
+        # ── Show results if a prediction has been run ────────────
+        if st.session_state.last_row_id is not None:
+            ml_prob = st.session_state.last_ml_prob
+            blended = st.session_state.last_blended
+            risk    = st.session_state.last_risk
+            issues  = st.session_state.last_issues
+            action  = st.session_state.last_action
+            wo      = st.session_state.last_wo
+            row_id  = st.session_state.last_row_id
 
             # ── Primary metrics ──────────────────────────────────
             col1, col2, col3 = st.columns(3)
@@ -378,16 +403,14 @@ def main():
             col2.metric("Risk level", risk)
             col3.metric("Priority score", f"${wo['priority_score']:,.0f}")
 
-            # ── Score breakdown — makes the logic transparent ────
+            # ── Score breakdown ──────────────────────────────────
             with st.expander("📊 Score breakdown", expanded=True):
                 bcol1, bcol2 = st.columns(2)
-                bcol1.metric("ML model probability",
-                             f"{ml_prob:.1%}",
+                bcol1.metric("ML model probability", f"{ml_prob:.1%}",
                              help="What the Random Forest learned from historical failures")
-                n_iss = len(issues)
-                rule_signal = round(n_iss / len(THRESHOLDS), 3)
-                bcol2.metric("Rule signal (issues)",
-                             f"{rule_signal:.1%}",
+                n_iss        = len(issues)
+                rule_signal  = round(n_iss / len(THRESHOLDS), 3)
+                bcol2.metric("Rule signal (issues)", f"{rule_signal:.1%}",
                              f"{n_iss} of {len(THRESHOLDS)} thresholds breached",
                              help="Fraction of sensor thresholds currently in violation")
 
@@ -410,17 +433,24 @@ def main():
             else:
                 st.success("No threshold violations detected.")
 
-            # Technician feedback (inline)
+            # ── Technician feedback ──────────────────────────────
             st.subheader("🔁 Technician feedback")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                if st.button("✅ Failure confirmed"):
-                    record_feedback(row_id, confirmed=True)
-                    st.success("Feedback recorded — will improve next model retraining.")
-            with col_b:
-                if st.button("❌ False alarm"):
-                    record_feedback(row_id, confirmed=False)
-                    st.info("False alarm logged.")
+
+            if st.session_state.last_feedback_given:
+                st.success("✅ Feedback recorded — thank you. Run a new prediction to continue.")
+            else:
+                st.caption(f"Recording feedback for **WO-{row_id:05d}**")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("✅ Failure confirmed", key="btn_confirm"):
+                        record_feedback(row_id, confirmed=True)
+                        st.session_state.last_feedback_given = True
+                        st.rerun()
+                with col_b:
+                    if st.button("❌ False alarm", key="btn_false"):
+                        record_feedback(row_id, confirmed=False)
+                        st.session_state.last_feedback_given = True
+                        st.rerun()
 
     # ── TAB 2: Live sensor simulation ────────────────────────────
     with tab2:
@@ -611,7 +641,7 @@ def main():
         fb_df = load_feedback()
 
         if fb_df.empty:
-            st.info("No feedback logged yet.")
+            st.info("No predictions logged yet — run a prediction in the Prediction tab first.")
         else:
             confirmed   = fb_df[fb_df["confirmed"] == 1]
             false_alarm = fb_df[fb_df["confirmed"] == 0]
@@ -622,19 +652,45 @@ def main():
             c2.metric("❌ False alarms",       len(false_alarm))
             c3.metric("⏳ Pending review",     len(pending))
 
-            precision = (
-                len(confirmed) / (len(confirmed) + len(false_alarm))
-                if (len(confirmed) + len(false_alarm)) > 0
-                else None
-            )
-            if precision is not None:
+            if (len(confirmed) + len(false_alarm)) > 0:
+                precision = len(confirmed) / (len(confirmed) + len(false_alarm))
                 st.progress(precision, text=f"Field precision: {precision:.1%}")
 
+            # Human-readable status column
+            def status_label(row):
+                if row["confirmed"] == 1:   return "✅ Confirmed failure"
+                if row["confirmed"] == 0:   return "❌ False alarm"
+                return "⏳ Pending"
+
+            display_df = fb_df.copy()
+            display_df["Status"]      = display_df.apply(status_label, axis=1)
+            display_df["Probability"] = display_df["probability"].apply(lambda x: f"{x:.1%}")
+            display_df["Timestamp"]   = display_df["ts"].str[:19].str.replace("T", " ")
+
             st.dataframe(
-                fb_df[["id", "ts", "equipment", "risk", "probability", "confirmed", "notes"]]
-                .rename(columns={"id": "ID", "ts": "Timestamp"}),
+                display_df[["id", "Timestamp", "equipment", "risk", "Probability", "Status", "notes"]]
+                .rename(columns={"id": "WO", "equipment": "Equipment",
+                                 "risk": "Risk", "notes": "Notes"}),
                 use_container_width=True,
+                hide_index=True,
             )
+
+            # Allow feedback on any pending row directly from this tab
+            pending_rows = fb_df[fb_df["confirmed"].isna()]
+            if not pending_rows.empty:
+                st.markdown("---")
+                st.markdown("**Give feedback on pending predictions:**")
+                for _, row in pending_rows.iterrows():
+                    with st.expander(f"WO-{row['id']:05d} | {row['equipment']} | {row['risk']} | {row['ts'][:16]}"):
+                        fa, fb2 = st.columns(2)
+                        with fa:
+                            if st.button("✅ Confirm failure", key=f"confirm_{row['id']}"):
+                                record_feedback(int(row["id"]), confirmed=True)
+                                st.rerun()
+                        with fb2:
+                            if st.button("❌ False alarm", key=f"false_{row['id']}"):
+                                record_feedback(int(row["id"]), confirmed=False)
+                                st.rerun()
 
             if st.button("🔄 Trigger model retraining"):
                 aug = retrain_from_feedback(df, equipment)
