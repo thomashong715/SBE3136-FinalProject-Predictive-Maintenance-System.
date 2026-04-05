@@ -226,38 +226,44 @@ def diagnose(features: dict) -> list[str]:
     return issues
 
 
-def predict(model, features: dict) -> tuple[float, str]:
+def predict(model, features: dict) -> tuple[float, float, str]:
     """
-    Returns (probability, risk_label).
-    Risk combines ML probability AND simultaneous issue count:
-      - 3+ violations escalates LOW → MEDIUM
-      - 4+ violations escalates anything → HIGH
-    Prevents the model under-calling risk when many sensors are in the red.
+    Returns (ml_prob, blended_prob, risk_label).
+
+    - ml_prob      : raw model probability (what the ML learned)
+    - blended_prob : weighted blend of ML + rule signal from issue count
+    - risk         : label derived from blended_prob only
+
+    Blending formula:
+        issue_signal = n_issues / max_issues  (0.0 → 1.0)
+        blended = 0.65 × ml_prob + 0.35 × issue_signal
+
+    This means 4 violations adds ~0.28 to the score even if the model
+    is uncertain — but a very high ML probability still dominates.
+    No silent hard overrides that confuse the audience.
     """
     X = pd.DataFrame([features])[FEATURE_NAMES]
-    prob = model.predict_proba(X)[0][1]
+    ml_prob = model.predict_proba(X)[0][1]
 
-    # Base risk from model probability (lowered thresholds for FM sensitivity)
-    if prob > 0.60:
+    n_issues    = len(diagnose(features))
+    max_issues  = len(THRESHOLDS)                        # 5 possible
+    issue_signal = n_issues / max_issues                 # 0.0 → 1.0
+
+    blended = round(0.65 * ml_prob + 0.35 * issue_signal, 4)
+
+    if blended > 0.55:
         risk = "HIGH"
-    elif prob > 0.30:
+    elif blended > 0.28:
         risk = "MEDIUM"
     else:
         risk = "LOW"
 
-    # Escalate based on simultaneous threshold violations
-    n_issues = len(diagnose(features))
-    if n_issues >= 4:
-        risk = "HIGH"
-    elif n_issues >= 3 and risk == "LOW":
-        risk = "MEDIUM"
-
-    return round(prob, 4), risk
+    return round(ml_prob, 4), blended, risk
 
 
 def recommend(risk: str, issues: list[str]) -> str:
     n = len(issues)
-    if risk == "HIGH" or n >= 4:
+    if risk == "HIGH":
         return "⛔ Immediate inspection required — escalate to senior technician"
     if n >= 3:
         return "⚠️ Multiple faults detected — urgent maintenance within 24 h"
@@ -359,16 +365,40 @@ def main():
     # ── TAB 1: Manual prediction ─────────────────────────────────
     with tab1:
         if st.button("▶ Run prediction", type="primary"):
-            prob, risk = predict(model, features)
-            issues     = diagnose(features)
-            action     = recommend(risk, issues)
-            row_id     = log_prediction(equipment, features, prob, risk)
-            wo         = build_work_order(equipment, features, prob, risk, issues, action, row_id)
+            ml_prob, blended, risk = predict(model, features)
+            issues  = diagnose(features)
+            action  = recommend(risk, issues)
+            row_id  = log_prediction(equipment, features, blended, risk)
+            wo      = build_work_order(equipment, features, blended, risk, issues, action, row_id)
 
+            # ── Primary metrics ──────────────────────────────────
             col1, col2, col3 = st.columns(3)
-            col1.metric("Failure probability", f"{prob:.1%}")
+            col1.metric("Blended risk score", f"{blended:.1%}",
+                        help="65% ML model + 35% rule-based issue signal")
             col2.metric("Risk level", risk)
             col3.metric("Priority score", f"${wo['priority_score']:,.0f}")
+
+            # ── Score breakdown — makes the logic transparent ────
+            with st.expander("📊 Score breakdown", expanded=True):
+                bcol1, bcol2 = st.columns(2)
+                bcol1.metric("ML model probability",
+                             f"{ml_prob:.1%}",
+                             help="What the Random Forest learned from historical failures")
+                n_iss = len(issues)
+                rule_signal = round(n_iss / len(THRESHOLDS), 3)
+                bcol2.metric("Rule signal (issues)",
+                             f"{rule_signal:.1%}",
+                             f"{n_iss} of {len(THRESHOLDS)} thresholds breached",
+                             help="Fraction of sensor thresholds currently in violation")
+
+                if ml_prob < 0.30 and n_iss >= 3:
+                    st.info(
+                        f"ℹ️ The ML model alone scores this low ({ml_prob:.1%}), but "
+                        f"{n_iss} sensors are simultaneously in violation. "
+                        "The blended score reflects both signals — this combination "
+                        "warrants attention even if the model hasn't seen this exact "
+                        "pattern frequently in training data."
+                    )
 
             st.markdown(f"**Work order:** `{wo['wo_id']}`")
             st.markdown(f"**Recommendation:** {action}")
@@ -439,12 +469,12 @@ def main():
 
             if step < len(rows):
                 live_features = rows[step]
-                prob, risk    = predict(eq_model, live_features)
+                ml_prob, blended, risk = predict(eq_model, live_features)
                 issues        = diagnose(live_features)
                 action        = recommend(risk, issues)
 
                 st.session_state.sim_history.append({
-                    "step": step + 1, "prob": prob, "risk": risk, "action": action,
+                    "step": step + 1, "prob": blended, "risk": risk, "action": action,
                     "features": live_features,
                 })
                 st.session_state.sim_step += 1
@@ -452,9 +482,9 @@ def main():
                 # ── Live metrics ─────────────────────────────────
                 st.markdown(f"### Step {step + 1} / {len(rows)} — {eq}")
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Failure probability", f"{prob:.1%}")
+                c1.metric("Blended risk score", f"{blended:.1%}")
                 c2.metric("Risk level", risk)
-                c3.metric("Priority score", f"${priority_score(prob, eq, risk):,.0f}")
+                c3.metric("Priority score", f"${priority_score(blended, eq, risk):,.0f}")
 
                 risk_color = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(risk, "⚪")
                 st.markdown(f"**{risk_color} Action:** {action}")
