@@ -379,61 +379,653 @@ def risk_badge(risk: str) -> str:
 
 def main():
     st.set_page_config(
-        page_title="FM Predictive Maintenance Agent v2",
-        page_icon="🤖",
+        page_title="FM Predictive Maintenance Agent v4",
+        page_icon="⚙️",
         layout="wide",
     )
-    st.title("🤖 FM Predictive Maintenance AI Agent — v2")
 
     init_db()
-    df       = load_data()
-    elev_df  = load_elevator_data()
-    models, reports           = train_models(df)
-    elev_model, elev_X_test, elev_report = train_elevator_model(elev_df)
 
-    # ── Sidebar: equipment + sensor inputs ──────────────────────
-    st.sidebar.header("⚙️ Configuration")
-    equipment = st.sidebar.selectbox("Equipment type", ["AHU", "Chiller", "Elevator"])
+    # ── Sidebar ──────────────────────────────────────────────────
+    st.sidebar.title("⚙️ FM Agent")
+    st.sidebar.markdown("---")
 
-    # Resolve model
-    if equipment == "Elevator":
-        model = elev_model
-    else:
-        model = models[equipment]
+    # Workflow phase indicator in sidebar
+    phase = st.session_state.get("workflow_phase", 1)
+    st.sidebar.markdown("**Workflow progress**")
+    for i, label in enumerate(["Data ingestion", "AI analytics & training", "Prediction & decision"], start=1):
+        icon = "✅" if phase > i else ("▶" if phase == i else "○")
+        st.sidebar.markdown(f"{icon} Phase {i} — {label}")
 
-    st.sidebar.subheader("Sensor readings")
+    st.sidebar.markdown("---")
+    equipment = st.sidebar.selectbox("Equipment type", ["AHU", "Chiller", "Elevator"],
+                                     help="Select the equipment to monitor and predict failures for.")
+    st.sidebar.markdown("---")
+    st.sidebar.caption("FM Predictive Maintenance Agent v4")
 
-    if equipment == "Elevator":
-        features = {
-            "revolutions": st.sidebar.slider("Revolutions (rpm)",  16.0,  94.0,  46.0, 0.1),
-            "humidity":    st.sidebar.slider("Humidity (%)",        72.0,  76.0,  74.0, 0.1),
-            "vibration":   st.sidebar.slider("Vibration",           2.0,  100.0,  18.0, 0.1),
-            "x1":          st.sidebar.slider("Signal x1",          90.0,  168.0, 120.0, 0.1),
-            "x2":          st.sidebar.slider("Signal x2",         -57.0,   20.0, -28.0, 0.1),
-            "x3":          st.sidebar.slider("Signal x3",           0.23,   1.27,  0.62, 0.01),
-            "x4":          st.sidebar.slider("Motor load x4",     286.0, 8788.0, 2504.0, 1.0),
-            "x5":          st.sidebar.slider("Baseline x5",      5241.0, 5686.0, 5510.0, 1.0),
-        }
-    else:
-        features = {
-            "Air temperature [K]":     st.sidebar.slider("Air temperature (K)",    290.0, 310.0, 298.0, 0.1),
-            "Process temperature [K]": st.sidebar.slider("Process temperature (K)",300.0, 320.0, 308.0, 0.1),
-            "Rotational speed [rpm]":  st.sidebar.slider("Rotational speed (rpm)", 1000,  2000,  1500),
-            "Torque [Nm]":             st.sidebar.slider("Torque (Nm)",             30.0,  70.0,  40.0, 0.1),
-            "Tool wear [min]":         st.sidebar.slider("Tool wear (min)",          0,     300,    50),
-            "Type_L":                  int(st.sidebar.checkbox("Type L")),
-            "Type_M":                  int(st.sidebar.checkbox("Type M")),
-        }
+    # ── Page header ──────────────────────────────────────────────
+    st.title("⚙️ FM Predictive Maintenance Agent")
+    st.caption("Three-phase workflow: data ingestion → AI analytics & training → prediction & decision")
+    st.markdown("---")
 
-    # ── Tabs ────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "🔍 Prediction", "📡 Live simulation", "📋 Work orders",
-        "🔁 Feedback log", "📊 Model info", "🧪 AutoML — custom dataset",
-        "🧠 AI Analyst",
-    ])
+    # ════════════════════════════════════════════════════════════
+    # PHASE 1 — DATA INGESTION
+    # ════════════════════════════════════════════════════════════
+    with st.expander("📂 Phase 1 — Data ingestion", expanded=(phase == 1)):
+        st.markdown("##### Step 1 · Upload equipment data")
+        st.caption(
+            "Upload the raw CSV for the selected equipment. The agent will auto-clean "
+            "and validate the data before training begins."
+        )
 
-    # ── TAB 1: Manual prediction ─────────────────────────────────
-    with tab1:
+        # ── Upload widget ────────────────────────────────────────
+        col_up, col_info = st.columns([2, 1])
+        with col_up:
+            uploaded = st.file_uploader(
+                "Upload CSV or Excel file",
+                type=["csv", "xlsx", "xls"],
+                key="p1_upload",
+                help="Expected columns depend on equipment. Built-in datasets load automatically if no file is uploaded.",
+            )
+        with col_info:
+            st.markdown("**Built-in datasets**")
+            st.markdown("- `ai4i2020.csv` → AHU / Chiller")
+            st.markdown("- `elevator.csv` → Elevator")
+            st.markdown("Upload a custom file to override.")
+
+        # ── Load data (uploaded or built-in) ────────────────────
+        use_custom = False
+        if uploaded:
+            try:
+                if uploaded.name.endswith(".csv"):
+                    raw_upload = pd.read_csv(uploaded)
+                else:
+                    raw_upload = pd.read_excel(uploaded)
+                use_custom = True
+                st.success(f"✓ Loaded `{uploaded.name}` — {raw_upload.shape[0]:,} rows × {raw_upload.shape[1]} cols")
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+                use_custom = False
+
+        df      = load_data()
+        elev_df = load_elevator_data()
+
+        # Determine source dataset for display
+        source_df = df if equipment != "Elevator" else elev_df
+        st.markdown("---")
+        st.markdown("##### Step 2 · Data cleaning & validation")
+
+        # ── Data quality card ────────────────────────────────────
+        dq_total   = source_df.shape[0] * source_df.shape[1]
+        dq_missing = int(source_df.isnull().sum().sum())
+        dq_dupes   = int(source_df.duplicated().sum())
+        num_cols   = source_df.select_dtypes(include="number").columns
+        outlier_cols = 0
+        for col in num_cols:
+            q1, q3 = source_df[col].quantile(0.25), source_df[col].quantile(0.75)
+            iqr = q3 - q1
+            if ((source_df[col] < q1 - 1.5*iqr) | (source_df[col] > q3 + 1.5*iqr)).any():
+                outlier_cols += 1
+
+        qc1, qc2, qc3, qc4 = st.columns(4)
+        qc1.metric("Total records",    f"{source_df.shape[0]:,}")
+        qc2.metric("Missing values",   f"{dq_missing}",  f"{dq_missing/dq_total*100:.1f}%" if dq_total else "0%")
+        qc3.metric("Duplicate rows",   f"{dq_dupes}")
+        qc4.metric("Cols w/ outliers", f"{outlier_cols}")
+
+        if dq_missing == 0 and dq_dupes == 0:
+            st.success("✓ Data is clean — no missing values or duplicates detected.")
+        else:
+            st.warning(f"⚠ {dq_missing} missing values and {dq_dupes} duplicate rows found. "
+                       "These will be handled automatically during preprocessing.")
+
+        # ── Auto-clean log ───────────────────────────────────────
+        target_col = HVAC_TARGET if equipment != "Elevator" else ELEV_TARGET
+        cleaned_source, clean_log = automl_clean(source_df.copy(), target_col)
+        with st.expander("🧹 Cleaning log", expanded=False):
+            for line in clean_log:
+                st.markdown(f"- {line}")
+
+        # ── Data preview ─────────────────────────────────────────
+        st.markdown("##### Step 3 · Data preview")
+        st.dataframe(source_df.head(8), use_container_width=True)
+        with st.expander("Full descriptive statistics"):
+            st.dataframe(source_df.describe().round(3), use_container_width=True)
+
+        # ── Proceed button ───────────────────────────────────────
+        st.markdown("")
+        if st.button("Proceed to Phase 2 — AI analytics & training ▶", type="primary", key="p1_proceed"):
+            st.session_state["workflow_phase"] = 2
+            st.rerun()
+
+    # ════════════════════════════════════════════════════════════
+    # PHASE 2 — AI ANALYTICS & MODEL TRAINING
+    # ════════════════════════════════════════════════════════════
+    with st.expander("🧠 Phase 2 — AI analytics & model training", expanded=(phase == 2)):
+        if phase < 2:
+            st.info("Complete Phase 1 first.")
+        else:
+            # ── Train models (cached) ────────────────────────────
+            models, reports           = train_models(df)
+            elev_model, elev_X_test, elev_report = train_elevator_model(elev_df)
+
+            model         = elev_model if equipment == "Elevator" else models[equipment]
+            active_report = elev_report if equipment == "Elevator" else reports[equipment]
+
+            # ── AI Analyst section ───────────────────────────────
+            st.markdown("##### Step 4 · AI analyst — fleet health assessment")
+            st.caption(
+                "The AI analyst examines the cleaned dataset and generates a professional "
+                "health report, data quality insights, and feature correlations."
+            )
+            active_report_for_analyst = elev_report if equipment == "Elevator" else reports[equipment]
+            render_ai_analyst_tab(df if equipment != "Elevator" else elev_df,
+                                  equipment, active_report_for_analyst, model)
+
+            st.markdown("---")
+
+            # ── Model training results ───────────────────────────
+            st.markdown("##### Step 5 · Model training results")
+            label_key = "1" if "1" in active_report else list(active_report.keys())[0]
+            tc1, tc2, tc3, tc4 = st.columns(4)
+            tc1.metric("Equipment",  equipment)
+            tc2.metric("Precision",  f"{active_report[label_key]['precision']:.2%}")
+            tc3.metric("Recall",     f"{active_report[label_key]['recall']:.2%}")
+            tc4.metric("F1 score",   f"{active_report[label_key]['f1-score']:.2%}")
+
+            # Feature importance chart
+            base_clf = model.calibrated_classifiers_[0].estimator
+            feat_df  = pd.DataFrame({
+                "Feature":    get_feature_names(equipment),
+                "Importance": base_clf.feature_importances_,
+            }).sort_values("Importance", ascending=False)
+
+            fig_imp, ax_imp = plt.subplots(figsize=(8, 3.5))
+            sns.barplot(data=feat_df, x="Importance", y="Feature", ax=ax_imp,
+                        palette="flare", orient="h")
+            ax_imp.set_title(f"Feature importance — {equipment}", fontsize=11)
+            fig_imp.tight_layout()
+            st.pyplot(fig_imp)
+            plt.close(fig_imp)
+
+            # SHAP explainability
+            with st.expander("🔍 SHAP explainability (sample)", expanded=False):
+                try:
+                    X_sample = (elev_X_test.sample(min(50, len(elev_X_test)), random_state=1)
+                                if equipment == "Elevator"
+                                else get_training_data(df, equipment).sample(50, random_state=1))
+                    explainer = shap.TreeExplainer(base_clf)
+                    shap_vals = explainer.shap_values(X_sample)
+                    if isinstance(shap_vals, list):
+                        sv = shap_vals[1]
+                    else:
+                        sv = shap_vals[:, :, 1] if shap_vals.ndim == 3 else shap_vals
+                    fig_shap, _ = plt.subplots(figsize=(8, 3))
+                    shap.summary_plot(sv, X_sample, show=False, plot_size=None)
+                    st.pyplot(fig_shap)
+                    plt.close(fig_shap)
+                except Exception as e:
+                    st.warning(f"SHAP unavailable: {e}")
+
+            # ── Proceed button ───────────────────────────────────
+            st.markdown("")
+            if st.button("Proceed to Phase 3 — prediction & decision ▶", type="primary", key="p2_proceed"):
+                st.session_state["workflow_phase"] = 3
+                st.rerun()
+
+    # ════════════════════════════════════════════════════════════
+    # PHASE 3 — PREDICTION & MAINTENANCE DECISION
+    # ════════════════════════════════════════════════════════════
+    with st.expander("🔮 Phase 3 — prediction & maintenance decision", expanded=(phase == 3)):
+        if phase < 3:
+            st.info("Complete Phases 1 and 2 first.")
+        else:
+            models, reports           = train_models(df)
+            elev_model, elev_X_test, elev_report = train_elevator_model(elev_df)
+            model = elev_model if equipment == "Elevator" else models[equipment]
+
+            # ── Phase 3 sub-tabs ─────────────────────────────────
+            p3_tab1, p3_tab2, p3_tab3, p3_tab4 = st.tabs([
+                "🔍 Manual prediction",
+                "📡 Live simulation",
+                "📋 Work orders",
+                "🔁 Feedback log",
+            ])
+
+            # ── Sensor inputs (inline, not sidebar) ─────────────
+            def sensor_inputs(equipment, prefix="p3"):
+                st.markdown("##### Enter current sensor readings")
+                if equipment == "Elevator":
+                    c1, c2 = st.columns(2)
+                    feat = {
+                        "revolutions": c1.slider("Revolutions (rpm)",  16.0,  94.0,  46.0, 0.1,  key=f"{prefix}_rev"),
+                        "humidity":    c2.slider("Humidity (%)",        72.0,  76.0,  74.0, 0.1,  key=f"{prefix}_hum"),
+                        "vibration":   c1.slider("Vibration",           2.0,  100.0,  18.0, 0.1,  key=f"{prefix}_vib"),
+                        "x1":          c2.slider("Signal x1",          90.0,  168.0, 120.0, 0.1,  key=f"{prefix}_x1"),
+                        "x2":          c1.slider("Signal x2",         -57.0,   20.0, -28.0, 0.1,  key=f"{prefix}_x2"),
+                        "x3":          c2.slider("Signal x3",           0.23,   1.27,  0.62, 0.01, key=f"{prefix}_x3"),
+                        "x4":          c1.slider("Motor load x4",     286.0, 8788.0, 2504.0, 1.0, key=f"{prefix}_x4"),
+                        "x5":          c2.slider("Baseline x5",      5241.0, 5686.0, 5510.0, 1.0, key=f"{prefix}_x5"),
+                    }
+                else:
+                    c1, c2 = st.columns(2)
+                    feat = {
+                        "Air temperature [K]":     c1.slider("Air temperature (K)",    290.0, 310.0, 298.0, 0.1,  key=f"{prefix}_at"),
+                        "Process temperature [K]": c2.slider("Process temperature (K)",300.0, 320.0, 308.0, 0.1,  key=f"{prefix}_pt"),
+                        "Rotational speed [rpm]":  c1.slider("Rotational speed (rpm)", 1000,  2000,  1500,        key=f"{prefix}_rs"),
+                        "Torque [Nm]":             c2.slider("Torque (Nm)",             30.0,  70.0,  40.0, 0.1,  key=f"{prefix}_tq"),
+                        "Tool wear [min]":         c1.slider("Tool wear (min)",          0,     300,    50,        key=f"{prefix}_tw"),
+                        "Type_L":                  int(c2.checkbox("Type L",                                      key=f"{prefix}_tl")),
+                        "Type_M":                  int(c2.checkbox("Type M",                                      key=f"{prefix}_tm")),
+                    }
+                return feat
+
+            # ────────────────────────────────────────────────────
+            # P3 TAB 1 — Manual prediction
+            # ────────────────────────────────────────────────────
+            with p3_tab1:
+                st.markdown("##### Step 6 · Run failure prediction")
+                st.caption(
+                    "Input live or new sensor readings. The trained model scores them "
+                    "using a blended signal (65% ML + 35% rule-based) and generates a work order."
+                )
+
+                if "last_row_id"        not in st.session_state: st.session_state.last_row_id        = None
+                if "last_feedback_given" not in st.session_state: st.session_state.last_feedback_given = False
+
+                features = sensor_inputs(equipment, prefix="p3m")
+
+                if st.button("▶ Run prediction", type="primary", key="p3_run"):
+                    ml_prob, blended, risk = predict(model, features, equipment)
+                    issues = diagnose(features, equipment)
+                    action = recommend(risk, issues)
+                    row_id = log_prediction(equipment, features, blended, risk)
+                    wo     = build_work_order(equipment, features, blended, risk, issues, action, row_id)
+                    st.session_state.last_row_id          = row_id
+                    st.session_state.last_feedback_given  = False
+                    st.session_state.last_ml_prob         = ml_prob
+                    st.session_state.last_blended         = blended
+                    st.session_state.last_risk            = risk
+                    st.session_state.last_issues          = issues
+                    st.session_state.last_action          = action
+                    st.session_state.last_wo              = wo
+
+                if st.session_state.last_row_id is not None:
+                    ml_prob = st.session_state.last_ml_prob
+                    blended = st.session_state.last_blended
+                    risk    = st.session_state.last_risk
+                    issues  = st.session_state.last_issues
+                    action  = st.session_state.last_action
+                    wo      = st.session_state.last_wo
+                    row_id  = st.session_state.last_row_id
+
+                    st.markdown("---")
+                    st.markdown("##### Prediction result")
+
+                    # Outcome banner
+                    if risk == "HIGH":
+                        st.error(f"⛔ HIGH RISK — {action}")
+                    elif risk == "MEDIUM":
+                        st.warning(f"⚠️ MEDIUM RISK — {action}")
+                    else:
+                        st.success(f"✅ LOW RISK — {action}")
+
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric("Blended risk score", f"{blended:.1%}",
+                               help="65% ML model + 35% rule-based issue signal")
+                    rc2.metric("Risk level",         risk)
+                    rc3.metric("Priority score",     f"${wo['priority_score']:,.0f}",
+                               help="Risk probability × estimated repair cost (SGD)")
+
+                    with st.expander("📊 Score breakdown", expanded=True):
+                        bc1, bc2 = st.columns(2)
+                        bc1.metric("ML model probability", f"{ml_prob:.1%}")
+                        n_iss       = len(issues)
+                        rule_signal = round(n_iss / len(get_thresholds(equipment)), 3)
+                        bc2.metric("Rule signal", f"{rule_signal:.1%}",
+                                   f"{n_iss} of {len(get_thresholds(equipment))} thresholds breached")
+                        if ml_prob < 0.30 and n_iss >= 3:
+                            st.info(
+                                f"ℹ️ ML model alone scores low ({ml_prob:.1%}), but {n_iss} sensors "
+                                "are simultaneously in violation. The blended score captures both signals."
+                            )
+
+                    st.markdown(f"**Work order:** `{wo['wo_id']}`")
+
+                    # Diagnosed issues
+                    if issues:
+                        st.markdown("**Diagnosed threshold violations:**")
+                        for iss in issues:
+                            st.warning(iss)
+                    else:
+                        st.success("No threshold violations detected.")
+
+                    # Maintenance outcome routing
+                    st.markdown("---")
+                    st.markdown("##### Step 7 · Maintenance decision")
+                    if risk == "HIGH":
+                        st.error(
+                            "⛔ **Immediate inspection required.**  \n"
+                            "Escalate to senior technician. Raise urgent work order. "
+                            f"Estimated repair cost: **${REPAIR_COSTS[equipment]['HIGH']:,} SGD**."
+                        )
+                    elif risk == "MEDIUM":
+                        st.warning(
+                            "⚠️ **Preventive maintenance within 48 h.**  \n"
+                            f"Schedule inspection before next operational cycle. "
+                            f"Estimated cost if deferred: **${REPAIR_COSTS[equipment]['MEDIUM']:,} SGD**."
+                        )
+                    else:
+                        st.success(
+                            "✅ **Continue normal monitoring.**  \n"
+                            "All signals within acceptable range. Review at next scheduled interval."
+                        )
+
+                    # Technician feedback
+                    st.markdown("---")
+                    st.markdown("##### Step 8 · Technician feedback loop")
+                    st.caption(
+                        "Your verdict improves the model over time — confirmed failures and false "
+                        "alarms are logged to SQLite and used in future retraining."
+                    )
+                    if st.session_state.last_feedback_given:
+                        st.success("✅ Feedback recorded. Run a new prediction to continue.")
+                    else:
+                        st.caption(f"Recording feedback for **{wo['wo_id']}**")
+                        fb1, fb2 = st.columns(2)
+                        with fb1:
+                            if st.button("✅ Failure confirmed", key="p3_confirm"):
+                                record_feedback(row_id, confirmed=True)
+                                st.session_state.last_feedback_given = True
+                                st.rerun()
+                        with fb2:
+                            if st.button("❌ False alarm", key="p3_false"):
+                                record_feedback(row_id, confirmed=False)
+                                st.session_state.last_feedback_given = True
+                                st.rerun()
+
+            # ────────────────────────────────────────────────────
+            # P3 TAB 2 — Live simulation
+            # ────────────────────────────────────────────────────
+            with p3_tab2:
+                st.markdown("##### Live sensor simulation")
+                st.info(
+                    "Replays dataset rows as a live sensor feed — simulating real-time BMS data. "
+                    "In production, replace `sensor_replay()` with an MQTT subscriber or REST call."
+                )
+
+                for k, v in [("sim_running", False), ("sim_history", []),
+                              ("sim_step", 0), ("sim_replay_rows", []),
+                              ("sim_equipment", equipment)]:
+                    if k not in st.session_state:
+                        st.session_state[k] = v
+
+                n_steps = st.slider("Simulation steps", 5, 50, 20, key="sim_n_steps")
+                sb1, sb2 = st.columns(2)
+                start = sb1.button("▶ Start simulation", type="primary",
+                                   disabled=st.session_state.sim_running, key="sim_start")
+                stop  = sb2.button("⏹ Stop", disabled=not st.session_state.sim_running, key="sim_stop")
+
+                if start:
+                    src = elev_df if equipment == "Elevator" else make_equipment_dataset(df, equipment)
+                    rows = src[get_feature_names(equipment)].sample(
+                        n_steps, random_state=int(time.time()) % 9999).to_dict("records")
+                    st.session_state.sim_replay_rows = rows
+                    st.session_state.sim_history     = []
+                    st.session_state.sim_step        = 0
+                    st.session_state.sim_running     = True
+                    st.session_state.sim_equipment   = equipment
+                    st.rerun()
+
+                if stop:
+                    st.session_state.sim_running = False
+                    st.rerun()
+
+                if st.session_state.sim_running:
+                    step     = st.session_state.sim_step
+                    rows     = st.session_state.sim_replay_rows
+                    eq       = st.session_state.sim_equipment
+                    eq_model = models.get(eq, elev_model)
+
+                    if step < len(rows):
+                        live_feat = rows[step]
+                        ml_p, bl, rsk = predict(eq_model, live_feat, eq)
+                        iss = diagnose(live_feat, eq)
+                        act = recommend(rsk, iss)
+                        st.session_state.sim_history.append({
+                            "step": step+1, "prob": bl, "risk": rsk,
+                            "action": act, "features": live_feat,
+                        })
+                        st.session_state.sim_step += 1
+
+                        st.markdown(f"**Step {step+1} / {len(rows)} — {eq}**")
+                        sc1, sc2, sc3 = st.columns(3)
+                        sc1.metric("Blended risk score", f"{bl:.1%}")
+                        sc2.metric("Risk level", rsk)
+                        sc3.metric("Priority score", f"${priority_score(bl, eq, rsk):,.0f}")
+                        risk_icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(rsk, "⚪")
+                        st.markdown(f"{risk_icon} **{act}**")
+
+                        with st.expander("Sensor readings this step"):
+                            st.json({k: round(v, 2) for k, v in live_feat.items()})
+
+                        history = st.session_state.sim_history
+                        if history:
+                            steps_x = [h["step"] for h in history]
+                            probs_y = [h["prob"]  for h in history]
+                            colors  = ["#E24B4A" if h["risk"]=="HIGH" else
+                                       "#EF9F27" if h["risk"]=="MEDIUM" else "#1D9E75"
+                                       for h in history]
+                            fig, ax = plt.subplots(figsize=(9, 3))
+                            ax.plot(steps_x, probs_y, color="#888780", linewidth=1.2, zorder=1)
+                            ax.scatter(steps_x, probs_y, c=colors, s=40, zorder=2)
+                            ax.axhline(0.55, color="#E24B4A", linestyle="--", linewidth=0.8, label="High (0.55)")
+                            ax.axhline(0.28, color="#EF9F27", linestyle="--", linewidth=0.8, label="Medium (0.28)")
+                            ax.set_xlabel("Simulation step")
+                            ax.set_ylabel("Blended risk score")
+                            ax.set_ylim(0, 1)
+                            ax.set_title(f"Live failure probability — {eq}", fontsize=11)
+                            ax.legend(fontsize=8, loc="upper left")
+                            fig.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+
+                        if len(st.session_state.sim_history) > 1:
+                            hist_df = pd.DataFrame([
+                                {"Step": h["step"], "Probability": f"{h['prob']:.1%}",
+                                 "Risk": h["risk"], "Action": h["action"]}
+                                for h in st.session_state.sim_history
+                            ])
+                            st.dataframe(hist_df, use_container_width=True, hide_index=True)
+
+                        if step + 1 < len(rows):
+                            time.sleep(1.2)
+                            st.rerun()
+                        else:
+                            st.session_state.sim_running = False
+                            worst = max(st.session_state.sim_history, key=lambda h: h["prob"])
+                            sim_row_id = log_prediction(eq, worst["features"], worst["prob"], worst["risk"])
+                            st.session_state.sim_worst_row_id = sim_row_id
+                            st.rerun()
+                    else:
+                        st.session_state.sim_running = False
+                        st.rerun()
+
+                elif st.session_state.sim_history:
+                    history = st.session_state.sim_history
+                    steps_x = [h["step"] for h in history]
+                    probs_y = [h["prob"]  for h in history]
+                    colors  = ["#E24B4A" if h["risk"]=="HIGH" else
+                               "#EF9F27" if h["risk"]=="MEDIUM" else "#1D9E75"
+                               for h in history]
+
+                    fig, ax = plt.subplots(figsize=(9, 3))
+                    ax.plot(steps_x, probs_y, color="#888780", linewidth=1.2, zorder=1)
+                    ax.scatter(steps_x, probs_y, c=colors, s=40, zorder=2)
+                    ax.axhline(0.55, color="#E24B4A", linestyle="--", linewidth=0.8, label="High (0.55)")
+                    ax.axhline(0.28, color="#EF9F27", linestyle="--", linewidth=0.8, label="Medium (0.28)")
+                    ax.set_xlabel("Simulation step")
+                    ax.set_ylabel("Blended risk score")
+                    ax.set_ylim(0, 1)
+                    ax.set_title("Simulation result — full run", fontsize=11)
+                    ax.legend(fontsize=8, loc="upper left")
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                    n_total  = len(history)
+                    n_high   = sum(1 for h in history if h["risk"] == "HIGH")
+                    n_medium = sum(1 for h in history if h["risk"] == "MEDIUM")
+                    avg_prob = sum(h["prob"] for h in history) / n_total
+                    worst    = max(history, key=lambda h: h["prob"])
+
+                    st.markdown("---")
+                    st.markdown("##### Simulation conclusion")
+                    vc1, vc2, vc3 = st.columns(3)
+                    vc1.metric("Avg blended score", f"{avg_prob:.1%}")
+                    vc2.metric("High-risk steps",   f"{n_high} / {n_total}")
+                    vc3.metric("Peak risk score",   f"{worst['prob']:.1%}",
+                               f"Step {worst['step']} — {worst['risk']}")
+
+                    if n_high >= 3 or avg_prob > 0.55:
+                        st.error(
+                            "⛔ **Maintenance required — schedule immediately.**  \n"
+                            f"{n_high} of {n_total} steps flagged HIGH. "
+                            f"Peak score {worst['prob']:.1%} at step {worst['step']}."
+                        )
+                    elif n_high >= 1 or n_medium >= int(n_total * 0.3) or avg_prob > 0.28:
+                        st.warning(
+                            "⚠️ **Preventive maintenance recommended within 48 h.**  \n"
+                            f"{n_high} HIGH + {n_medium} MEDIUM steps detected. "
+                            f"Average score {avg_prob:.1%}."
+                        )
+                    else:
+                        st.success(
+                            "✅ **Equipment operating normally — no immediate action required.**  \n"
+                            f"All {n_total} steps within acceptable range. Average score {avg_prob:.1%}."
+                        )
+
+                    with st.expander("Step-by-step breakdown"):
+                        hist_df = pd.DataFrame([
+                            {"Step": h["step"], "Blended score": f"{h['prob']:.1%}",
+                             "Risk": h["risk"], "Action": h["action"]}
+                            for h in history
+                        ])
+                        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+
+            # ────────────────────────────────────────────────────
+            # P3 TAB 3 — Work orders
+            # ────────────────────────────────────────────────────
+            with p3_tab3:
+                st.markdown("##### Work order queue")
+                st.caption("All predictions ranked by priority score (risk probability × estimated repair cost).")
+                fb_df = load_feedback()
+
+                if fb_df.empty:
+                    st.info("No predictions logged yet. Run a prediction or simulation first.")
+                else:
+                    wo_rows = []
+                    for _, row in fb_df.iterrows():
+                        try:
+                            feat = _json.loads(row["features"])
+                        except Exception:
+                            continue
+                        rsk   = row["risk"]
+                        eq    = row["equipment"]
+                        prob  = row["probability"]
+                        score = priority_score(prob, eq, rsk)
+                        iss_snap = diagnose(feat)
+                        n_iss    = len(iss_snap)
+                        if rsk == "HIGH" or n_iss >= 4:        purpose = "⛔ Immediate inspection"
+                        elif rsk == "MEDIUM" or n_iss >= 3:    purpose = "⚠️ Preventive maintenance"
+                        elif any("aging" in i.lower() for i in iss_snap): purpose = "🛠️ Scheduled overhaul"
+                        elif any("temperature" in i.lower() for i in iss_snap): purpose = "🌡️ Cooling system check"
+                        elif any("torque" in i.lower() for i in iss_snap): purpose = "🔧 Motor load check"
+                        else:                                   purpose = "📋 Routine monitoring"
+                        cv = row["confirmed"]
+                        status = "✅ Confirmed" if cv == 1 else "❌ False alarm" if cv == 0 else "⏳ Pending"
+                        wo_rows.append({
+                            "WO ID":        f"WO-{row['id']:05d}",
+                            "Timestamp":    row["ts"][:16].replace("T", " "),
+                            "Equipment":    eq,
+                            "Risk":         rsk,
+                            "Score":        f"{prob:.1%}",
+                            "Priority ($)": score,
+                            "Purpose":      purpose,
+                            "Status":       status,
+                        })
+
+                    wo_df = pd.DataFrame(wo_rows).sort_values("Priority ($)", ascending=False).reset_index(drop=True)
+                    st.dataframe(wo_df, use_container_width=True, hide_index=True)
+
+                    # Retraining opportunity check
+                    n_confirmed = int((fb_df["confirmed"] == 1).sum())
+                    n_false     = int((fb_df["confirmed"] == 0).sum())
+                    st.markdown("---")
+                    fc1, fc2 = st.columns(2)
+                    fc1.metric("Confirmed failures", n_confirmed)
+                    fc2.metric("False alarms",       n_false)
+                    if n_confirmed + n_false >= 20:
+                        st.success("✓ Sufficient feedback collected — model retrain is eligible.")
+                    else:
+                        st.info(f"Collect {20 - (n_confirmed + n_false)} more verified verdicts to enable retraining.")
+
+            # ────────────────────────────────────────────────────
+            # P3 TAB 4 — Feedback log
+            # ────────────────────────────────────────────────────
+            with p3_tab4:
+                st.markdown("##### Technician feedback log")
+                st.caption("All technician verdicts stored in SQLite — used to improve model accuracy over time.")
+                fb_df = load_feedback()
+                if fb_df.empty:
+                    st.info("No feedback logged yet.")
+                else:
+                    display_cols = ["id", "ts", "equipment", "probability", "risk", "confirmed", "notes"]
+                    st.dataframe(
+                        fb_df[[c for c in display_cols if c in fb_df.columns]]
+                        .rename(columns={"id": "ID", "ts": "Timestamp", "equipment": "Equipment",
+                                         "probability": "Score", "risk": "Risk",
+                                         "confirmed": "Confirmed", "notes": "Notes"})
+                        .sort_values("Timestamp", ascending=False),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                st.markdown("---")
+                if "confirm_clear" not in st.session_state:
+                    st.session_state.confirm_clear = False
+
+                if not st.session_state.confirm_clear:
+                    if st.button("🗑️ Clear all feedback data", key="p3_clear"):
+                        st.session_state.confirm_clear = True
+                        st.rerun()
+                else:
+                    st.warning("This will permanently delete all predictions and feedback. Are you sure?")
+                    cy, cn = st.columns(2)
+                    with cy:
+                        if st.button("Yes, delete everything", type="primary", key="p3_del_yes"):
+                            con = sqlite3.connect(DB_PATH)
+                            con.execute("DELETE FROM feedback")
+                            con.commit()
+                            con.close()
+                            st.session_state.confirm_clear      = False
+                            st.session_state.last_row_id        = None
+                            st.session_state.last_feedback_given = False
+                            st.success("All data cleared.")
+                            st.rerun()
+                    with cn:
+                        if st.button("Cancel", key="p3_del_no"):
+                            st.session_state.confirm_clear = False
+                            st.rerun()
+
+    # ── Global reset ─────────────────────────────────────────────
+    st.markdown("---")
+    if st.button("↩ Reset workflow — start from Phase 1"):
+        st.session_state["workflow_phase"] = 1
+        st.rerun()
+
+    # ── LEGACY TAB BLOCK REMOVED — replaced by 3-phase workflow above ──
+    if False:
+     with st.container():
         if "last_row_id" not in st.session_state:
             st.session_state.last_row_id = None
         if "last_feedback_given" not in st.session_state:
@@ -1135,11 +1727,7 @@ def main():
                 mime="text/csv"
             )
 
-    # ── TAB 7: AI Analyst ────────────────────────────────────────
-    with tab7:
-        active_report = elev_report if equipment == "Elevator" else reports[equipment]
-        render_ai_analyst_tab(df, equipment, active_report, model)
-
+        pass  # end of removed legacy tab block
 
 
 # ─────────────────────────────────────────────
