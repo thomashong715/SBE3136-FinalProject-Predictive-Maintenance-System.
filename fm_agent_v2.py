@@ -434,24 +434,28 @@ def main():
             st.markdown("Upload a custom file to override.")
 
         # ── Load data (uploaded or built-in) ────────────────────
-        use_custom = False
+        df      = load_data()
+        elev_df = load_elevator_data()
+
         if uploaded:
             try:
                 if uploaded.name.endswith(".csv"):
                     raw_upload = pd.read_csv(uploaded)
                 else:
                     raw_upload = pd.read_excel(uploaded)
-                use_custom = True
-                st.success(f"✓ Loaded `{uploaded.name}` — {raw_upload.shape[0]:,} rows × {raw_upload.shape[1]} cols")
+                st.success(f"\u2713 Loaded `{uploaded.name}` \u2014 {raw_upload.shape[0]:,} rows \u00d7 {raw_upload.shape[1]} cols")
+                st.session_state["uploaded_df"]   = raw_upload
+                st.session_state["uploaded_name"] = uploaded.name
             except Exception as e:
                 st.error(f"Could not read file: {e}")
-                use_custom = False
 
-        df      = load_data()
-        elev_df = load_elevator_data()
-
-        # Determine source dataset for display
-        source_df = df if equipment != "Elevator" else elev_df
+        # Priority: uploaded file > built-in dataset matching equipment selection
+        if "uploaded_df" in st.session_state:
+            source_df = st.session_state["uploaded_df"]
+            st.caption(f"Showing uploaded file: `{st.session_state.get('uploaded_name', 'custom')}`")
+        else:
+            source_df = df if equipment != "Elevator" else elev_df
+            st.caption(f"Showing built-in dataset for **{equipment}**.")
         st.markdown("---")
         st.markdown("##### Step 2 · Data cleaning & validation")
 
@@ -480,7 +484,13 @@ def main():
                        "These will be handled automatically during preprocessing.")
 
         # ── Auto-clean log ───────────────────────────────────────
-        target_col = HVAC_TARGET if equipment != "Elevator" else ELEV_TARGET
+        # Auto-detect target column: prefer HVAC_TARGET, fall back to ELEV_TARGET
+        if HVAC_TARGET in source_df.columns:
+            target_col = HVAC_TARGET
+        elif ELEV_TARGET in source_df.columns:
+            target_col = ELEV_TARGET
+        else:
+            target_col = source_df.columns[-1]  # last column as fallback
         cleaned_source, clean_log = automl_clean(source_df.copy(), target_col)
         with st.expander("🧹 Cleaning log", expanded=False):
             for line in clean_log:
@@ -492,11 +502,19 @@ def main():
         with st.expander("Full descriptive statistics"):
             st.dataframe(source_df.describe().round(3), use_container_width=True)
 
-        # ── Proceed button ───────────────────────────────────────
+        # ── Clear uploaded file + Proceed ────────────────────────
         st.markdown("")
-        if st.button("Proceed to Phase 2 — AI analytics & training ▶", type="primary", key="p1_proceed"):
-            st.session_state["workflow_phase"] = 2
-            st.rerun()
+        btn_col1, btn_col2 = st.columns([2, 1])
+        with btn_col1:
+            if st.button("Proceed to Phase 2 — AI analytics & training ▶", type="primary", key="p1_proceed"):
+                st.session_state["workflow_phase"] = 2
+                st.rerun()
+        with btn_col2:
+            if "uploaded_df" in st.session_state:
+                if st.button("🗑 Clear uploaded file", key="p1_clear_upload"):
+                    del st.session_state["uploaded_df"]
+                    st.session_state.pop("uploaded_name", None)
+                    st.rerun()
 
     # ════════════════════════════════════════════════════════════
     # PHASE 2 — AI ANALYTICS & MODEL TRAINING
@@ -505,12 +523,22 @@ def main():
         if phase < 2:
             st.info("Complete Phase 1 first.")
         else:
+            # ── Load datasets (cached built-ins) ─────────────────
+            df      = load_data()
+            elev_df = load_elevator_data()
+
             # ── Train models (cached) ────────────────────────────
             models, reports           = train_models(df)
             elev_model, elev_X_test, elev_report = train_elevator_model(elev_df)
 
             model         = elev_model if equipment == "Elevator" else models[equipment]
             active_report = elev_report if equipment == "Elevator" else reports[equipment]
+
+            # Resolve which dataset to show in analyst (uploaded takes priority)
+            analyst_df = st.session_state.get(
+                "uploaded_df",
+                df if equipment != "Elevator" else elev_df
+            )
 
             # ── AI Analyst section ───────────────────────────────
             st.markdown("##### Step 4 · AI analyst — fleet health assessment")
@@ -519,8 +547,7 @@ def main():
                 "health report, data quality insights, and feature correlations."
             )
             active_report_for_analyst = elev_report if equipment == "Elevator" else reports[equipment]
-            render_ai_analyst_tab(df if equipment != "Elevator" else elev_df,
-                                  equipment, active_report_for_analyst, model)
+            render_ai_analyst_tab(analyst_df, equipment, active_report_for_analyst, model)
 
             st.markdown("---")
 
@@ -580,6 +607,8 @@ def main():
         if phase < 3:
             st.info("Complete Phases 1 and 2 first.")
         else:
+            df      = load_data()
+            elev_df = load_elevator_data()
             models, reports           = train_models(df)
             elev_model, elev_X_test, elev_report = train_elevator_model(elev_df)
             model = elev_model if equipment == "Elevator" else models[equipment]
