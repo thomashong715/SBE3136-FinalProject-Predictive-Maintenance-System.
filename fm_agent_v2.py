@@ -523,22 +523,58 @@ def main():
         if phase < 2:
             st.info("Complete Phase 1 first.")
         else:
-            # ── Load datasets (cached built-ins) ─────────────────
+            # ── Load built-in datasets (cached) ──────────────────
             df      = load_data()
             elev_df = load_elevator_data()
 
-            # ── Train models (cached) ────────────────────────────
-            models, reports           = train_models(df)
-            elev_model, elev_X_test, elev_report = train_elevator_model(elev_df)
+            # ── Resolve active dataset & equipment label ──────────
+            # Uploaded file always takes priority over built-in datasets.
+            # We detect whether it is an Elevator or HVAC dataset by its columns.
+            uploaded_df   = st.session_state.get("uploaded_df", None)
+            uploaded_name = st.session_state.get("uploaded_name", "")
 
-            model         = elev_model if equipment == "Elevator" else models[equipment]
-            active_report = elev_report if equipment == "Elevator" else reports[equipment]
+            if uploaded_df is not None:
+                # Detect dataset type from columns
+                if ELEV_TARGET in uploaded_df.columns and HVAC_TARGET not in uploaded_df.columns:
+                    active_equipment = "Elevator"
+                elif HVAC_TARGET in uploaded_df.columns:
+                    active_equipment = equipment  # keep sidebar selection for HVAC variants
+                else:
+                    active_equipment = equipment
+                analyst_df = uploaded_df
+                data_label = f"uploaded — `{uploaded_name}`"
+            else:
+                active_equipment = equipment
+                analyst_df = df if equipment != "Elevator" else elev_df
+                data_label = f"built-in ({equipment})"
 
-            # Resolve which dataset to show in analyst (uploaded takes priority)
-            analyst_df = st.session_state.get(
-                "uploaded_df",
-                df if equipment != "Elevator" else elev_df
-            )
+            st.info(f"Training on: {data_label}  |  Equipment context: **{active_equipment}**")
+
+            # ── Train on uploaded data if present, else use cached built-in models ──
+            if uploaded_df is not None:
+                with st.spinner("Training model on uploaded dataset…"):
+                    # Detect target column
+                    if HVAC_TARGET in uploaded_df.columns:
+                        train_target = HVAC_TARGET
+                    elif ELEV_TARGET in uploaded_df.columns:
+                        train_target = ELEV_TARGET
+                    else:
+                        train_target = uploaded_df.columns[-1]
+
+                    cleaned_upload, _ = automl_clean(uploaded_df.copy(), train_target)
+                    upload_model, upload_feat_names, upload_X_test, upload_y_test, upload_report =                         automl_train(cleaned_upload, train_target)
+
+                model         = upload_model
+                active_report = upload_report
+                feat_names    = upload_feat_names
+                X_test_ref    = upload_X_test
+            else:
+                models, reports             = train_models(df)
+                elev_model, elev_X_test, elev_report = train_elevator_model(elev_df)
+                model         = elev_model if active_equipment == "Elevator" else models[active_equipment]
+                active_report = elev_report if active_equipment == "Elevator" else reports[active_equipment]
+                feat_names    = get_feature_names(active_equipment)
+                X_test_ref    = elev_X_test if active_equipment == "Elevator"                                 else get_training_data(df, active_equipment).sample(50, random_state=1)
 
             # ── AI Analyst section ───────────────────────────────
             st.markdown("##### Step 4 · AI analyst — fleet health assessment")
@@ -546,8 +582,7 @@ def main():
                 "The AI analyst examines the cleaned dataset and generates a professional "
                 "health report, data quality insights, and feature correlations."
             )
-            active_report_for_analyst = elev_report if equipment == "Elevator" else reports[equipment]
-            render_ai_analyst_tab(analyst_df, equipment, active_report_for_analyst, model)
+            render_ai_analyst_tab(analyst_df, active_equipment, active_report, model)
 
             st.markdown("---")
 
@@ -555,7 +590,7 @@ def main():
             st.markdown("##### Step 5 · Model training results")
             label_key = "1" if "1" in active_report else list(active_report.keys())[0]
             tc1, tc2, tc3, tc4 = st.columns(4)
-            tc1.metric("Equipment",  equipment)
+            tc1.metric("Equipment",  active_equipment)
             tc2.metric("Precision",  f"{active_report[label_key]['precision']:.2%}")
             tc3.metric("Recall",     f"{active_report[label_key]['recall']:.2%}")
             tc4.metric("F1 score",   f"{active_report[label_key]['f1-score']:.2%}")
@@ -563,14 +598,14 @@ def main():
             # Feature importance chart
             base_clf = model.calibrated_classifiers_[0].estimator
             feat_df  = pd.DataFrame({
-                "Feature":    get_feature_names(equipment),
+                "Feature":    feat_names,
                 "Importance": base_clf.feature_importances_,
             }).sort_values("Importance", ascending=False)
 
             fig_imp, ax_imp = plt.subplots(figsize=(8, 3.5))
             sns.barplot(data=feat_df, x="Importance", y="Feature", ax=ax_imp,
                         palette="flare", orient="h")
-            ax_imp.set_title(f"Feature importance — {equipment}", fontsize=11)
+            ax_imp.set_title(f"Feature importance — {active_equipment}", fontsize=11)
             fig_imp.tight_layout()
             st.pyplot(fig_imp)
             plt.close(fig_imp)
@@ -578,9 +613,7 @@ def main():
             # SHAP explainability
             with st.expander("🔍 SHAP explainability (sample)", expanded=False):
                 try:
-                    X_sample = (elev_X_test.sample(min(50, len(elev_X_test)), random_state=1)
-                                if equipment == "Elevator"
-                                else get_training_data(df, equipment).sample(50, random_state=1))
+                    X_sample  = X_test_ref.sample(min(50, len(X_test_ref)), random_state=1)
                     explainer = shap.TreeExplainer(base_clf)
                     shap_vals = explainer.shap_values(X_sample)
                     if isinstance(shap_vals, list):
@@ -609,9 +642,28 @@ def main():
         else:
             df      = load_data()
             elev_df = load_elevator_data()
-            models, reports           = train_models(df)
-            elev_model, elev_X_test, elev_report = train_elevator_model(elev_df)
-            model = elev_model if equipment == "Elevator" else models[equipment]
+
+            # Resolve model the same way Phase 2 does:
+            # uploaded dataset trains a custom model; otherwise use built-in cached models.
+            uploaded_df   = st.session_state.get("uploaded_df", None)
+            uploaded_name = st.session_state.get("uploaded_name", "")
+
+            if uploaded_df is not None:
+                if ELEV_TARGET in uploaded_df.columns and HVAC_TARGET not in uploaded_df.columns:
+                    active_equipment = "Elevator"
+                else:
+                    active_equipment = equipment
+                train_target = (HVAC_TARGET if HVAC_TARGET in uploaded_df.columns
+                                else ELEV_TARGET if ELEV_TARGET in uploaded_df.columns
+                                else uploaded_df.columns[-1])
+                cleaned_upload, _ = automl_clean(uploaded_df.copy(), train_target)
+                model, p3_feat_names, _, _, _ = automl_train(cleaned_upload, train_target)
+            else:
+                active_equipment = equipment
+                models, reports           = train_models(df)
+                elev_model, elev_X_test, _ = train_elevator_model(elev_df)
+                model         = elev_model if active_equipment == "Elevator" else models[active_equipment]
+                p3_feat_names = get_feature_names(active_equipment)
 
             # ── Phase 3 sub-tabs ─────────────────────────────────
             p3_tab1, p3_tab2, p3_tab3, p3_tab4 = st.tabs([
@@ -814,7 +866,7 @@ def main():
                     step     = st.session_state.sim_step
                     rows     = st.session_state.sim_replay_rows
                     eq       = st.session_state.sim_equipment
-                    eq_model = models.get(eq, elev_model)
+                    eq_model = model  # use the model resolved above (uploaded or built-in)
 
                     if step < len(rows):
                         live_feat = rows[step]
