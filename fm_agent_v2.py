@@ -1343,6 +1343,10 @@ Use actual numbers from the dataset context. Be specific and practical. FM manag
 
 def _render_narrative(data: dict):
     """Render the structured fleet health report with rich visual components."""
+    # Safety: if somehow a non-dict slips through, show a fallback
+    if not isinstance(data, dict):
+        st.warning("Report format outdated — click Regenerate to refresh.")
+        return
     status = data.get("status", "MODERATE")
     status_colors = {
         "CRITICAL": ("#E24B4A", "🔴"),
@@ -1506,6 +1510,9 @@ def render_ai_analyst_tab(df, equipment, report, model):
     # ── Section A: Fleet health narrative ───────────────────────
     st.markdown("### Fleet health assessment")
     narr_key = f"analyst_narrative_{equipment}"
+    # Clear stale string values cached before the structured-report upgrade
+    if narr_key in st.session_state and not isinstance(st.session_state[narr_key], dict):
+        del st.session_state[narr_key]
     if narr_key not in st.session_state:
         if st.button("Generate fleet health report", key="gen_narrative"):
             with st.spinner("Analysing fleet data..."):
