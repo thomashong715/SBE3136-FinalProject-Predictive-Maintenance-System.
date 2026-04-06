@@ -1290,24 +1290,133 @@ def _stream_ai_response(client, messages: list, context: str) -> str:
     return "".join(collected)
 
 
-def _analyst_narrative(client, context: str) -> str:
-    """Generate the initial fleet health narrative (non-streaming for caching)."""
+def _analyst_narrative(client, context: str) -> dict:
+    """
+    Generate a structured fleet health report as JSON.
+    Returns a dict with keys: status, status_color, headline, summary,
+    risk_factors (list of {icon, title, detail}),
+    recommendations (list of {priority, action, impact}),
+    kpis (list of {label, value, delta}).
+    """
+    import json as _j
+    prompt = (
+        context
+        + """
+
+Return ONLY a JSON object (no markdown fences, no extra text) with this exact structure:
+{
+  "status": "CRITICAL | WARNING | MODERATE | HEALTHY",
+  "headline": "One sharp sentence summarising fleet health (≤20 words)",
+  "summary": "2-3 sentence executive summary for an FM manager — plain language, no jargon",
+  "kpis": [
+    {"label": "Failure Rate", "value": "XX%", "delta": "+X% vs benchmark"},
+    {"label": "Model Accuracy", "value": "XX%", "delta": "precision"},
+    {"label": "Records Analysed", "value": "XXX,XXX", "delta": "training samples"},
+    {"label": "Risk Level", "value": "HIGH | MEDIUM | LOW", "delta": "overall fleet"}
+  ],
+  "risk_factors": [
+    {"icon": "🔴", "title": "Short risk factor title", "detail": "1-2 sentence explanation with specific numbers from the data"},
+    {"icon": "🟡", "title": "Second risk factor", "detail": "..."},
+    {"icon": "🟠", "title": "Third risk factor", "detail": "..."}
+  ],
+  "recommendations": [
+    {"priority": "P1", "action": "Short action title", "impact": "Expected outcome / benefit", "urgency": "Immediate | Within 48h | Within 7 days"},
+    {"priority": "P2", "action": "...", "impact": "...", "urgency": "..."},
+    {"priority": "P3", "action": "...", "impact": "...", "urgency": "..."}
+  ]
+}
+Use actual numbers from the dataset context. Be specific and practical. FM manager audience."""
+    )
     resp = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=700,
-        messages=[{
-            "role": "user",
-            "content": (
-                context
-                + "\n\nWrite a professional 3-paragraph fleet health assessment for an FM manager:\n"
-                "1. Overall health status and failure rate interpretation\n"
-                "2. Key risk factors and operating conditions driving failures\n"
-                "3. Top 3 prioritised maintenance recommendations\n\n"
-                "Use plain paragraphs — no markdown headers or bullet lists."
-            ),
-        }],
+        max_tokens=900,
+        messages=[{"role": "user", "content": prompt}],
     )
-    return resp.content[0].text
+    raw = resp.content[0].text.strip()
+    # Strip accidental code fences
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return _j.loads(raw.strip())
+
+
+def _render_narrative(data: dict):
+    """Render the structured fleet health report with rich visual components."""
+    status = data.get("status", "MODERATE")
+    status_colors = {
+        "CRITICAL": ("#E24B4A", "🔴"),
+        "WARNING":  ("#EF9F27", "🟡"),
+        "MODERATE": ("#378ADD", "🔵"),
+        "HEALTHY":  ("#1D9E75", "🟢"),
+    }
+    color, icon = status_colors.get(status, ("#888780", "⚪"))
+
+    # ── Status banner ────────────────────────────────────────────
+    st.markdown(
+        f"""<div style="background:{color}18;border-left:5px solid {color};
+        border-radius:6px;padding:14px 18px;margin-bottom:16px">
+        <span style="font-size:22px">{icon}</span>
+        <span style="font-size:18px;font-weight:700;color:{color};margin-left:10px">
+        Fleet Status: {status}</span><br>
+        <span style="font-size:15px;color:#e0e0e0;margin-left:36px">
+        {data.get('headline','')}</span></div>""",
+        unsafe_allow_html=True,
+    )
+
+    # ── Executive summary ────────────────────────────────────────
+    st.markdown(
+        f"""<div style="background:#1e2130;border-radius:8px;padding:14px 18px;
+        margin-bottom:18px;color:#ccc;font-size:14px;line-height:1.7">
+        📋 <strong>Executive Summary</strong><br>{data.get('summary','')}</div>""",
+        unsafe_allow_html=True,
+    )
+
+    # ── KPI row ──────────────────────────────────────────────────
+    kpis = data.get("kpis", [])
+    if kpis:
+        cols = st.columns(len(kpis))
+        for col, kpi in zip(cols, kpis):
+            col.metric(kpi.get("label", ""), kpi.get("value", ""), kpi.get("delta", ""))
+
+    st.markdown("---")
+
+    left, right = st.columns(2)
+
+    # ── Risk factors ─────────────────────────────────────────────
+    with left:
+        st.markdown("#### ⚠️ Key Risk Factors")
+        for rf in data.get("risk_factors", []):
+            st.markdown(
+                f"""<div style="background:#2a2d3e;border-radius:8px;
+                padding:12px 15px;margin-bottom:10px">
+                <span style="font-size:18px">{rf.get('icon','⚠️')}</span>
+                <strong style="font-size:14px;margin-left:8px">{rf.get('title','')}</strong><br>
+                <span style="color:#aaa;font-size:13px;margin-left:28px;display:block;margin-top:4px">
+                {rf.get('detail','')}</span></div>""",
+                unsafe_allow_html=True,
+            )
+
+    # ── Recommendations ──────────────────────────────────────────
+    with right:
+        st.markdown("#### 🛠️ Maintenance Recommendations")
+        urgency_colors = {"Immediate": "#E24B4A", "Within 48h": "#EF9F27", "Within 7 days": "#1D9E75"}
+        for rec in data.get("recommendations", []):
+            urg   = rec.get("urgency", "Within 7 days")
+            ucol  = urgency_colors.get(urg, "#888780")
+            st.markdown(
+                f"""<div style="background:#2a2d3e;border-radius:8px;
+                padding:12px 15px;margin-bottom:10px">
+                <span style="background:{ucol};color:#fff;font-size:11px;font-weight:700;
+                padding:2px 8px;border-radius:4px">{rec.get('priority','')}</span>
+                <span style="background:#37415120;color:#aaa;font-size:11px;
+                padding:2px 8px;border-radius:4px;margin-left:6px">{urg}</span><br>
+                <strong style="font-size:14px;display:block;margin-top:6px">
+                {rec.get('action','')}</strong>
+                <span style="color:#aaa;font-size:13px">💡 {rec.get('impact','')}</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
 
 def _analyst_data_quality(df: pd.DataFrame) -> dict:
@@ -1407,7 +1516,7 @@ def render_ai_analyst_tab(df, equipment, report, model):
                 except Exception as e:
                     st.error(f"AI error: {e}")
     else:
-        st.markdown(st.session_state[narr_key])
+        _render_narrative(st.session_state[narr_key])
         if st.button("Regenerate", key="regen_narrative"):
             del st.session_state[narr_key]
             st.rerun()
