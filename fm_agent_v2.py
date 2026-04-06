@@ -12,8 +12,15 @@ Improvements over v1:
 import time
 import sqlite3
 import threading
+import json as _json
 from datetime import datetime
 from pathlib import Path
+
+try:
+    from anthropic import Anthropic as _Anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
 
 import numpy as np
 import pandas as pd
@@ -419,9 +426,10 @@ def main():
         }
 
     # ── Tabs ────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "🔍 Prediction", "📡 Live simulation", "📋 Work orders",
         "🔁 Feedback log", "📊 Model info", "🧪 AutoML — custom dataset",
+        "🧠 AI Analyst",
     ])
 
     # ── TAB 1: Manual prediction ─────────────────────────────────
@@ -1127,6 +1135,11 @@ def main():
                 mime="text/csv"
             )
 
+    # ── TAB 7: AI Analyst ────────────────────────────────────────
+    with tab7:
+        active_report = elev_report if equipment == "Elevator" else reports[equipment]
+        render_ai_analyst_tab(df, equipment, active_report, model)
+
 
 
 # ─────────────────────────────────────────────
@@ -1218,6 +1231,384 @@ def automl_train(cleaned: pd.DataFrame, target_col: str) -> tuple:
     y_pred = model.predict(X_test)
     report = classification_report(y_test, y_pred, output_dict=True)
     return model, feat_names, X_test, y_test, report
+
+
+# ─────────────────────────────────────────────
+# 9. AI ANALYST — helper functions
+# ─────────────────────────────────────────────
+
+def _build_analyst_context(df: pd.DataFrame, equipment: str, report: dict) -> str:
+    """Summarise dataset stats into a compact context string for the LLM."""
+    total   = len(df)
+    fail_col = HVAC_TARGET
+    failures = int(df[fail_col].sum()) if fail_col in df.columns else "N/A"
+    fail_rate = f"{failures/total*100:.2f}%" if isinstance(failures, int) else "N/A"
+
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    stats_rows = []
+    for col in numeric_cols[:12]:          # cap at 12 to stay compact
+        s = df[col]
+        stats_rows.append(
+            f"  {col}: mean={s.mean():.2f}, std={s.std():.2f}, "
+            f"min={s.min():.2f}, max={s.max():.2f}"
+        )
+
+    label_key = "1" if "1" in report else list(report.keys())[0]
+    precision = report[label_key]["precision"]
+    recall    = report[label_key]["recall"]
+    f1        = report[label_key]["f1-score"]
+
+    ctx = f"""
+=== FM PREDICTIVE MAINTENANCE — DATASET CONTEXT ===
+Equipment selected : {equipment}
+Total records      : {total:,}
+Failure events     : {failures}  ({fail_rate} failure rate)
+Target column      : {fail_col}
+Feature columns    : {', '.join(numeric_cols)}
+
+Numeric feature statistics:
+{chr(10).join(stats_rows)}
+
+Trained model performance (test set):
+  Precision : {precision:.2%}
+  Recall    : {recall:.2%}
+  F1 score  : {f1:.2%}
+
+You are an expert FM (Facility Management) data analyst and ML engineer.
+Answer questions about this dataset, the model, failure patterns, and
+maintenance recommendations using the statistics above.
+Keep answers concise, professional, and actionable.
+"""
+    return ctx
+
+
+def _stream_ai_response(client, messages: list, context: str) -> str:
+    """Call Anthropic with streaming and write chunks to st.write_stream."""
+    full_messages = [{"role": "user", "content": context + "\n\n" + messages[0]["content"]}]
+    if len(messages) > 1:
+        full_messages = (
+            [{"role": "user", "content": context + "\n\n" + messages[0]["content"]}]
+            + messages[1:]
+        )
+
+    collected = []
+    with client.messages.stream(
+        model="claude-sonnet-4-20250514",
+        max_tokens=900,
+        messages=full_messages,
+    ) as stream:
+        for text in stream.text_stream:
+            collected.append(text)
+            yield text
+    return "".join(collected)
+
+
+def _analyst_narrative(client, context: str) -> str:
+    """Generate the initial fleet health narrative (non-streaming for caching)."""
+    resp = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=700,
+        messages=[{
+            "role": "user",
+            "content": (
+                context
+                + "\n\nWrite a professional 3-paragraph fleet health assessment for an FM manager:\n"
+                "1. Overall health status and failure rate interpretation\n"
+                "2. Key risk factors and operating conditions driving failures\n"
+                "3. Top 3 prioritised maintenance recommendations\n\n"
+                "Use plain paragraphs — no markdown headers or bullet lists."
+            ),
+        }],
+    )
+    return resp.content[0].text
+
+
+def _analyst_data_quality(df: pd.DataFrame) -> dict:
+    """Return a data-quality summary dict."""
+    total_cells   = df.shape[0] * df.shape[1]
+    missing_total = int(df.isnull().sum().sum())
+    duplicate_rows = int(df.duplicated().sum())
+    numeric_cols   = df.select_dtypes(include="number").columns.tolist()
+
+    outlier_counts = {}
+    for col in numeric_cols:
+        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+        iqr = q3 - q1
+        n_out = int(((df[col] < q1 - 1.5 * iqr) | (df[col] > q3 + 1.5 * iqr)).sum())
+        if n_out:
+            outlier_counts[col] = n_out
+
+    return {
+        "total_cells":    total_cells,
+        "missing_total":  missing_total,
+        "missing_pct":    round(missing_total / total_cells * 100, 2) if total_cells else 0,
+        "duplicate_rows": duplicate_rows,
+        "outlier_counts": outlier_counts,
+    }
+
+
+# ─────────────────────────────────────────────
+# AI ANALYST TAB — inserted into main()
+# ─────────────────────────────────────────────
+# (called from within main() below via tab7)
+
+def render_ai_analyst_tab(df, equipment, report, model):
+    """Render the entire AI Analyst tab content."""
+
+    st.subheader("🧠 AI Analyst")
+    st.caption(
+        "Powered by Claude — ask anything about the dataset, model performance, "
+        "failure patterns, or maintenance strategy."
+    )
+
+    # ── API key input ────────────────────────────────────────────
+    st.markdown("#### Connect AI Analyst")
+    api_col1, api_col2 = st.columns([3, 1])
+    with api_col1:
+        api_key = st.text_input(
+            "Anthropic API key",
+            type="password",
+            placeholder="sk-ant-...",
+            key="analyst_api_key",
+            help="Get your key at console.anthropic.com. It is never stored.",
+        )
+    with api_col2:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        connected = bool(api_key)
+        if connected:
+            st.success("Connected")
+        else:
+            st.warning("No key")
+
+    if not _ANTHROPIC_AVAILABLE:
+        st.error(
+            "`anthropic` package not installed. Run: `pip install anthropic`"
+        )
+        return
+
+    if not api_key:
+        st.info(
+            "Enter your Anthropic API key above to activate the AI Analyst. "
+            "All other tabs work without it."
+        )
+        return
+
+    try:
+        client = _Anthropic(api_key=api_key)
+    except Exception as e:
+        st.error(f"Failed to initialise Anthropic client: {e}")
+        return
+
+    # Build context once per session (equipment may change)
+    ctx_key = f"analyst_ctx_{equipment}"
+    if ctx_key not in st.session_state:
+        st.session_state[ctx_key] = _build_analyst_context(df, equipment, report)
+    context = st.session_state[ctx_key]
+
+    st.markdown("---")
+
+    # ── Section A: Fleet health narrative ───────────────────────
+    st.markdown("### Fleet health assessment")
+    narr_key = f"analyst_narrative_{equipment}"
+    if narr_key not in st.session_state:
+        if st.button("Generate fleet health report", key="gen_narrative"):
+            with st.spinner("Analysing fleet data..."):
+                try:
+                    narr = _analyst_narrative(client, context)
+                    st.session_state[narr_key] = narr
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"AI error: {e}")
+    else:
+        st.markdown(st.session_state[narr_key])
+        if st.button("Regenerate", key="regen_narrative"):
+            del st.session_state[narr_key]
+            st.rerun()
+
+    st.markdown("---")
+
+    # ── Section B: Data quality report ──────────────────────────
+    st.markdown("### Data quality report")
+    dq = _analyst_data_quality(df)
+
+    dq_c1, dq_c2, dq_c3, dq_c4 = st.columns(4)
+    dq_c1.metric("Total cells",    f"{dq['total_cells']:,}")
+    dq_c2.metric("Missing values", f"{dq['missing_total']}",
+                 f"{dq['missing_pct']}% of data")
+    dq_c3.metric("Duplicate rows", dq["duplicate_rows"])
+    dq_c4.metric("Columns w/ outliers", len(dq["outlier_counts"]))
+
+    if dq["outlier_counts"]:
+        with st.expander("Outlier detail (IQR method)"):
+            out_df = pd.DataFrame(
+                [{"Column": k, "Outlier rows": v}
+                 for k, v in dq["outlier_counts"].items()]
+            ).sort_values("Outlier rows", ascending=False)
+            st.dataframe(out_df, use_container_width=True, hide_index=True)
+
+    # ── Section C: Feature distributions (top numeric cols) ─────
+    st.markdown("### Feature distributions")
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    show_cols    = [c for c in numeric_cols if c != HVAC_TARGET][:6]
+
+    if show_cols:
+        n_cols = 3
+        rows   = [show_cols[i:i+n_cols] for i in range(0, len(show_cols), n_cols)]
+        for row_cols in rows:
+            plot_cols = st.columns(len(row_cols))
+            for ax_col, feat in zip(plot_cols, row_cols):
+                with ax_col:
+                    fig, ax = plt.subplots(figsize=(3.5, 2.2))
+                    if HVAC_TARGET in df.columns:
+                        for label, grp in df.groupby(HVAC_TARGET):
+                            grp[feat].hist(ax=ax, bins=30, alpha=0.6,
+                                           label=f"{'Failure' if label==1 else 'Normal'}",
+                                           color="#E24B4A" if label==1 else "#378ADD")
+                        ax.legend(fontsize=7)
+                    else:
+                        df[feat].hist(ax=ax, bins=30, color="#378ADD")
+                    ax.set_title(feat, fontsize=9)
+                    ax.set_xlabel("")
+                    ax.tick_params(labelsize=7)
+                    fig.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+    # ── Section D: Correlation heatmap ──────────────────────────
+    st.markdown("### Correlation heatmap")
+    corr_cols = numeric_cols[:10]
+    if len(corr_cols) >= 2:
+        corr_matrix = df[corr_cols].corr()
+        fig_corr, ax_corr = plt.subplots(figsize=(8, 5))
+        sns.heatmap(
+            corr_matrix, annot=True, fmt=".2f", ax=ax_corr,
+            cmap="coolwarm", linewidths=0.5, linecolor="#2a2d3e",
+            annot_kws={"size": 8},
+        )
+        ax_corr.set_title("Feature correlation matrix", fontsize=11)
+        fig_corr.tight_layout()
+        st.pyplot(fig_corr)
+        plt.close(fig_corr)
+
+    # ── Section E: AI-powered correlations insight ──────────────
+    corr_insight_key = f"analyst_corr_{equipment}"
+    if len(corr_cols) >= 2:
+        if corr_insight_key not in st.session_state:
+            if st.button("Explain correlations with AI", key="corr_ai"):
+                corr_summary = corr_matrix.unstack().sort_values(ascending=False)
+                top_corrs = corr_summary[corr_summary < 1.0].head(6)
+                corr_text = "\n".join(
+                    [f"  {i[0]} ↔ {i[1]}: {v:.3f}" for i, v in top_corrs.items()]
+                )
+                with st.spinner("Interpreting correlations..."):
+                    try:
+                        resp = client.messages.create(
+                            model="claude-sonnet-4-20250514",
+                            max_tokens=400,
+                            messages=[{
+                                "role": "user",
+                                "content": (
+                                    context
+                                    + f"\n\nTop feature correlations:\n{corr_text}\n\n"
+                                    "In 3-4 sentences, explain what these correlations "
+                                    "mean for equipment failure in FM terms. "
+                                    "Be specific and practical."
+                                ),
+                            }],
+                        )
+                        st.session_state[corr_insight_key] = resp.content[0].text
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"AI error: {e}")
+        else:
+            st.info(st.session_state[corr_insight_key])
+            if st.button("Clear", key="clear_corr"):
+                del st.session_state[corr_insight_key]
+                st.rerun()
+
+    st.markdown("---")
+
+    # ── Section F: Natural language Q&A chat ────────────────────
+    st.markdown("### Ask the AI Analyst")
+    st.caption(
+        "Ask anything: failure patterns, feature importance, maintenance schedules, "
+        "what-if scenarios, or model behaviour."
+    )
+
+    # Suggested questions
+    suggestions = [
+        "What are the main causes of failure for this equipment?",
+        "Which features are most predictive of failure?",
+        "What tool wear threshold should trigger maintenance?",
+        "How does temperature affect failure probability?",
+        "Suggest a preventive maintenance schedule based on this data.",
+    ]
+    st.markdown("**Suggested questions:**")
+    sug_cols = st.columns(len(suggestions))
+    for i, (col, q) in enumerate(zip(sug_cols, suggestions)):
+        with col:
+            if st.button(q[:38] + "…" if len(q) > 38 else q, key=f"sug_{i}",
+                         use_container_width=True):
+                st.session_state.analyst_pending_q = q
+
+    # Chat history
+    if "analyst_chat" not in st.session_state:
+        st.session_state.analyst_chat = []   # list of {"role": ..., "content": ...}
+
+    # Display existing conversation
+    for msg in st.session_state.analyst_chat:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Handle suggested question injection
+    pending = st.session_state.pop("analyst_pending_q", None)
+
+    # Chat input
+    user_input = st.chat_input("Ask the AI Analyst…") or pending
+
+    if user_input:
+        # Append user message
+        st.session_state.analyst_chat.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # Build message list (context injected into first user turn)
+        history = st.session_state.analyst_chat
+        if len(history) == 1:
+            api_messages = [{"role": "user", "content": context + "\n\n" + user_input}]
+        else:
+            api_messages = (
+                [{"role": history[0]["role"],
+                  "content": context + "\n\n" + history[0]["content"]}]
+                + [{"role": m["role"], "content": m["content"]} for m in history[1:]]
+            )
+
+        # Stream response
+        with st.chat_message("assistant"):
+            try:
+                collected = []
+                response_placeholder = st.empty()
+                with client.messages.stream(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=700,
+                    messages=api_messages,
+                ) as stream:
+                    for chunk in stream.text_stream:
+                        collected.append(chunk)
+                        response_placeholder.markdown("".join(collected) + "▌")
+                full_response = "".join(collected)
+                response_placeholder.markdown(full_response)
+                st.session_state.analyst_chat.append(
+                    {"role": "assistant", "content": full_response}
+                )
+            except Exception as e:
+                st.error(f"AI error: {e}")
+
+    # Clear chat button
+    if st.session_state.analyst_chat:
+        if st.button("Clear conversation", key="clear_chat"):
+            st.session_state.analyst_chat = []
+            st.rerun()
 
 
 if __name__ == "__main__":
