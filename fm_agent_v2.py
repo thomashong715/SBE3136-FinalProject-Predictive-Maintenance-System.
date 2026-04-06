@@ -257,7 +257,7 @@ def retrain_from_feedback(base_df: pd.DataFrame, equipment: str) -> dict | None:
     rows = []
     for _, row in confirmed.iterrows():
         feat = json.loads(row["features"])
-        feat[TARGET] = int(row["confirmed"])
+        feat[HVAC_TARGET] = int(row["confirmed"])
         rows.append(feat)
 
     aug_df = pd.concat([base_df, pd.DataFrame(rows)], ignore_index=True)
@@ -280,15 +280,21 @@ def diagnose(features: dict, equipment: str = "AHU") -> list[str]:
     return issues
 
 
-def predict(model, features: dict, equipment: str = "AHU") -> tuple[float, float, str]:
+def predict(model, features: dict, equipment: str = "AHU",
+            feat_names: list | None = None) -> tuple[float, float, str]:
     """
     Returns (ml_prob, blended_prob, risk_label).
     Blending: 65% ML + 35% rule signal from issue count.
     Equipment-aware: uses correct feature list and thresholds.
+    feat_names: if provided (e.g. from automl_train), overrides the default
+                feature list so the DataFrame columns match what the model
+                was actually trained on.
     """
-    feat_names   = get_feature_names(equipment)
+    if feat_names is None:
+        feat_names = get_feature_names(equipment)
     thresholds   = get_thresholds(equipment)
-    X            = pd.DataFrame([features])[feat_names]
+    # Only select columns the model knows about; fill any missing with 0
+    X = pd.DataFrame([features]).reindex(columns=feat_names, fill_value=0)
     ml_prob      = model.predict_proba(X)[0][1]
 
     n_issues     = len(diagnose(features, equipment))
@@ -690,15 +696,32 @@ def main():
                     }
                 else:
                     c1, c2 = st.columns(2)
-                    feat = {
-                        "Air temperature [K]":     c1.slider("Air temperature (K)",    290.0, 310.0, 298.0, 0.1,  key=f"{prefix}_at"),
-                        "Process temperature [K]": c2.slider("Process temperature (K)",300.0, 320.0, 308.0, 0.1,  key=f"{prefix}_pt"),
-                        "Rotational speed [rpm]":  c1.slider("Rotational speed (rpm)", 1000,  2000,  1500,        key=f"{prefix}_rs"),
-                        "Torque [Nm]":             c2.slider("Torque (Nm)",             30.0,  70.0,  40.0, 0.1,  key=f"{prefix}_tq"),
-                        "Tool wear [min]":         c1.slider("Tool wear (min)",          0,     300,    50,        key=f"{prefix}_tw"),
-                        "Type_L":                  int(c2.checkbox("Type L",                                      key=f"{prefix}_tl")),
-                        "Type_M":                  int(c2.checkbox("Type M",                                      key=f"{prefix}_tm")),
-                    }
+                    if equipment == "Chiller":
+                        # Sliders in degC for operator convenience; converted to K for the model
+                        st.caption("Temperature inputs are in **degC** and will be converted to Kelvin automatically.")
+                        air_c  = c1.slider("Air temperature (degC)",     17.0, 37.0, 25.0, 0.1, key=f"{prefix}_at")
+                        proc_c = c2.slider("Process temperature (degC)", 27.0, 47.0, 35.0, 0.1, key=f"{prefix}_pt")
+                        feat = {
+                            "Air temperature [K]":     round(air_c  + 273.15, 2),
+                            "Process temperature [K]": round(proc_c + 273.15, 2),
+                            "Rotational speed [rpm]":  c1.slider("Rotational speed (rpm)", 1000, 2000, 1500,        key=f"{prefix}_rs"),
+                            "Torque [Nm]":             c2.slider("Torque (Nm)",             30.0,  70.0, 40.0, 0.1, key=f"{prefix}_tq"),
+                            "Tool wear [min]":         c1.slider("Tool wear (min)",          0,     300,  50,        key=f"{prefix}_tw"),
+                            "Type_L":                  int(c2.checkbox("Type L",                                    key=f"{prefix}_tl")),
+                            "Type_M":                  int(c2.checkbox("Type M",                                    key=f"{prefix}_tm")),
+                        }
+                        c1.caption(f"-> {air_c} degC = {feat['Air temperature [K]']} K")
+                        c2.caption(f"-> {proc_c} degC = {feat['Process temperature [K]']} K")
+                    else:
+                        feat = {
+                            "Air temperature [K]":     c1.slider("Air temperature (K)",    290.0, 310.0, 298.0, 0.1, key=f"{prefix}_at"),
+                            "Process temperature [K]": c2.slider("Process temperature (K)",300.0, 320.0, 308.0, 0.1, key=f"{prefix}_pt"),
+                            "Rotational speed [rpm]":  c1.slider("Rotational speed (rpm)", 1000,  2000,  1500,        key=f"{prefix}_rs"),
+                            "Torque [Nm]":             c2.slider("Torque (Nm)",             30.0,  70.0,  40.0, 0.1, key=f"{prefix}_tq"),
+                            "Tool wear [min]":         c1.slider("Tool wear (min)",          0,     300,    50,        key=f"{prefix}_tw"),
+                            "Type_L":                  int(c2.checkbox("Type L",                                      key=f"{prefix}_tl")),
+                            "Type_M":                  int(c2.checkbox("Type M",                                      key=f"{prefix}_tm")),
+                        }
                 return feat
 
             # ────────────────────────────────────────────────────
@@ -717,7 +740,7 @@ def main():
                 features = sensor_inputs(equipment, prefix="p3m")
 
                 if st.button("▶ Run prediction", type="primary", key="p3_run"):
-                    ml_prob, blended, risk = predict(model, features, equipment)
+                    ml_prob, blended, risk = predict(model, features, equipment, p3_feat_names)
                     issues = diagnose(features, equipment)
                     action = recommend(risk, issues)
                     row_id = log_prediction(equipment, features, blended, risk)
@@ -870,7 +893,7 @@ def main():
 
                     if step < len(rows):
                         live_feat = rows[step]
-                        ml_p, bl, rsk = predict(eq_model, live_feat, eq)
+                        ml_p, bl, rsk = predict(eq_model, live_feat, eq, p3_feat_names)
                         iss = diagnose(live_feat, eq)
                         act = recommend(rsk, iss)
                         st.session_state.sim_history.append({
@@ -1015,7 +1038,7 @@ def main():
                         eq    = row["equipment"]
                         prob  = row["probability"]
                         score = priority_score(prob, eq, rsk)
-                        iss_snap = diagnose(feat)
+                        iss_snap = diagnose(feat, eq)
                         n_iss    = len(iss_snap)
                         if rsk == "HIGH" or n_iss >= 4:        purpose = "⛔ Immediate inspection"
                         elif rsk == "MEDIUM" or n_iss >= 3:    purpose = "⚠️ Preventive maintenance"
