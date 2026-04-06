@@ -737,14 +737,14 @@ def main():
                 if "last_row_id"        not in st.session_state: st.session_state.last_row_id        = None
                 if "last_feedback_given" not in st.session_state: st.session_state.last_feedback_given = False
 
-                features = sensor_inputs(equipment, prefix="p3m")
+                features = sensor_inputs(active_equipment, prefix="p3m")
 
                 if st.button("▶ Run prediction", type="primary", key="p3_run"):
-                    ml_prob, blended, risk = predict(model, features, equipment, p3_feat_names)
-                    issues = diagnose(features, equipment)
+                    ml_prob, blended, risk = predict(model, features, active_equipment, p3_feat_names)
+                    issues = diagnose(features, active_equipment)
                     action = recommend(risk, issues)
-                    row_id = log_prediction(equipment, features, blended, risk)
-                    wo     = build_work_order(equipment, features, blended, risk, issues, action, row_id)
+                    row_id = log_prediction(active_equipment, features, blended, risk)
+                    wo     = build_work_order(active_equipment, features, blended, risk, issues, action, row_id)
                     st.session_state.last_row_id          = row_id
                     st.session_state.last_feedback_given  = False
                     st.session_state.last_ml_prob         = ml_prob
@@ -785,9 +785,9 @@ def main():
                         bc1, bc2 = st.columns(2)
                         bc1.metric("ML model probability", f"{ml_prob:.1%}")
                         n_iss       = len(issues)
-                        rule_signal = round(n_iss / len(get_thresholds(equipment)), 3)
+                        rule_signal = round(n_iss / len(get_thresholds(active_equipment)), 3)
                         bc2.metric("Rule signal", f"{rule_signal:.1%}",
-                                   f"{n_iss} of {len(get_thresholds(equipment))} thresholds breached")
+                                   f"{n_iss} of {len(get_thresholds(active_equipment))} thresholds breached")
                         if ml_prob < 0.30 and n_iss >= 3:
                             st.info(
                                 f"ℹ️ ML model alone scores low ({ml_prob:.1%}), but {n_iss} sensors "
@@ -811,13 +811,13 @@ def main():
                         st.error(
                             "⛔ **Immediate inspection required.**  \n"
                             "Escalate to senior technician. Raise urgent work order. "
-                            f"Estimated repair cost: **${REPAIR_COSTS[equipment]['HIGH']:,} SGD**."
+                            f"Estimated repair cost: **${REPAIR_COSTS[active_equipment]['HIGH']:,} SGD**."
                         )
                     elif risk == "MEDIUM":
                         st.warning(
                             "⚠️ **Preventive maintenance within 48 h.**  \n"
                             f"Schedule inspection before next operational cycle. "
-                            f"Estimated cost if deferred: **${REPAIR_COSTS[equipment]['MEDIUM']:,} SGD**."
+                            f"Estimated cost if deferred: **${REPAIR_COSTS[active_equipment]['MEDIUM']:,} SGD**."
                         )
                     else:
                         st.success(
@@ -860,7 +860,7 @@ def main():
 
                 for k, v in [("sim_running", False), ("sim_history", []),
                               ("sim_step", 0), ("sim_replay_rows", []),
-                              ("sim_equipment", equipment)]:
+                              ("sim_equipment", active_equipment)]:
                     if k not in st.session_state:
                         st.session_state[k] = v
 
@@ -871,14 +871,14 @@ def main():
                 stop  = sb2.button("⏹ Stop", disabled=not st.session_state.sim_running, key="sim_stop")
 
                 if start:
-                    src = elev_df if equipment == "Elevator" else make_equipment_dataset(df, equipment)
-                    rows = src[get_feature_names(equipment)].sample(
+                    src = elev_df if active_equipment == "Elevator" else make_equipment_dataset(df, active_equipment)
+                    rows = src[get_feature_names(active_equipment)].sample(
                         n_steps, random_state=int(time.time()) % 9999).to_dict("records")
                     st.session_state.sim_replay_rows = rows
                     st.session_state.sim_history     = []
                     st.session_state.sim_step        = 0
                     st.session_state.sim_running     = True
-                    st.session_state.sim_equipment   = equipment
+                    st.session_state.sim_equipment   = active_equipment
                     st.rerun()
 
                 if stop:
